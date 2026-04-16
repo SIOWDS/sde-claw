@@ -1,0 +1,26 @@
+{
+  "name": "sde-claw-cf",
+  "version": "0.6.0-cf",
+  "description": "SDE-Claw (龙爪手) on Cloudflare Workers + DeepSeek",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "deploy": "npm run build && wrangler deploy",
+    "cf-dev": "npm run build && wrangler dev",
+    "tail": "wrangler tail",
+    "secret:put": "wrangler secret put DEEPSEEK_API_KEY"
+  },
+  "dependencies": {
+    "mammoth": "^1.8.0",
+    "pdfjs-dist": "^4.7.76",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.3",
+    "vite": "^5.4.10",
+    "wrangler": "^4.20.0"
+  }
+}

@@ -1,0 +1,7 @@
+# Copy this file to .dev.vars (same directory)
+# .dev.vars is ONLY used by `wrangler dev` for local testing
+# For production secrets, use: wrangler secret put DEEPSEEK_API_KEY
+# 
+# .dev.vars is in .gitignore and will NOT be committed
+
+DEEPSEEK_API_KEY="sk-your-deepseek-key-here"
