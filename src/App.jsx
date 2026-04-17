@@ -2703,7 +2703,7 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
             })}
           </div>
         </div>
-        <div ref={qRef} style={{flex:1,overflow:"auto",padding:"10px 16px"}}>
+        <div ref={qRef} style={{flex:1,overflow:"auto",padding:"10px 16px",minHeight:0,maxHeight:"calc(100vh - 200px)",WebkitOverflowScrolling:"touch"}}>
           {qLogs.map((l,i)=><div key={i} style={{fontFamily:"monospace",fontSize:11,lineHeight:1.8,animation:"fi .1s",color:l.c||"rgba(0,0,0,.85)"}}>{l.m}</div>)}
 
           {qResult&&<div style={{marginTop:12,animation:"fi .3s"}}>
