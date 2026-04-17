@@ -7,6 +7,42 @@ if (typeof window !== "undefined") {
   pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).toString();
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// window.storage polyfill (for Claude artifact sandbox API compatibility)
+// Originally designed for Claude artifact's window.storage API;
+// here we reimplement on top of browser localStorage so it runs anywhere.
+// ═══════════════════════════════════════════════════════════════════
+if (typeof window !== "undefined" && !window.storage) {
+  window.storage = {
+    async set(key, value) {
+      try {
+        localStorage.setItem(key, typeof value === "string" ? value : JSON.stringify(value));
+        return { key, value };
+      } catch (e) {
+        console.error("storage.set failed", e);
+        throw e;
+      }
+    },
+    async get(key) {
+      const v = localStorage.getItem(key);
+      if (v === null) return null;
+      return { key, value: v };
+    },
+    async delete(key) {
+      localStorage.removeItem(key);
+      return { key, deleted: true };
+    },
+    async list(prefix = "") {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(prefix)) keys.push(k);
+      }
+      return { keys, prefix };
+    },
+  };
+}
+
 // ═══ File parsing ═══
 function stripHtml(html){
   // Remove style/script tags and their content first
