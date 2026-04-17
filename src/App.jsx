@@ -170,6 +170,97 @@ async function readFileAsText(file){
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// File-size / content limits (for the multi-paper input feature)
+// DeepSeek V3.2 context window is 128K tokens ≈ 95k Chinese chars
+// We reserve ~50% for prompts/output, so usable content budget ≈ 50K chars
+// ═══════════════════════════════════════════════════════════════════
+const FILE_LIMITS = {
+  SAFE_CHARS: 20000,      // 🟢 单篇字数安全上限(已扩至 2 万字)
+  WARN_CHARS: 40000,      // 🟡 超过 4 万字才警告(大论文)
+  SAFE_SIZE_MB: 10,       // 🟢 文件大小安全
+  WARN_SIZE_MB: 15,       // 🟡 警告
+  HARD_SIZE_MB: 30,       // 🔴 硬上限(拒绝)
+  SAFE_PAGES: 50,         // 🟢 PDF 页数安全
+  WARN_PAGES: 100,        // 🟡 警告
+  PER_PAPER_SENT: 20000,  // 每篇发给 DeepSeek 做结构化阅读的字符上限
+  TOTAL_BUDGET: 400000,   // 总上限:20 篇 × 2 万字
+};
+
+function getFileLevel(meta) {
+  // Returns "safe" | "warn" | "over"
+  if (!meta) return "unknown";
+  if (meta.sizeMB > FILE_LIMITS.HARD_SIZE_MB) return "over";
+  if (meta.chars > FILE_LIMITS.WARN_CHARS || meta.sizeMB > FILE_LIMITS.WARN_SIZE_MB || (meta.pages && meta.pages > FILE_LIMITS.WARN_PAGES)) return "over";
+  if (meta.chars > FILE_LIMITS.SAFE_CHARS || meta.sizeMB > FILE_LIMITS.SAFE_SIZE_MB || (meta.pages && meta.pages > FILE_LIMITS.SAFE_PAGES)) return "warn";
+  return "safe";
+}
+
+function getLevelBadge(level) {
+  if (level === "safe") return { icon: "🟢", color: "#10b981", label: "safe" };
+  if (level === "warn") return { icon: "🟡", color: "#f59e0b", label: "warn" };
+  if (level === "over") return { icon: "🔴", color: "#ef4444", label: "over" };
+  return { icon: "⚪", color: "#6b7280", label: "unknown" };
+}
+
+// Enhanced wrapper: returns both content and metadata (sizeMB, pages, chars, level, sentChars)
+// Backward compatible: existing callers of readFileAsText(file) still work
+async function readFileAsTextMeta(file) {
+  const sizeMB = +(file.size / 1024 / 1024).toFixed(2);
+  const ext = (file.name || "").split(".").pop().toLowerCase();
+  let pages = null;
+
+  // Hard size gate
+  if (sizeMB > FILE_LIMITS.HARD_SIZE_MB) {
+    return {
+      content: `[File exceeds ${FILE_LIMITS.HARD_SIZE_MB}MB hard limit: ${sizeMB}MB]`,
+      meta: { sizeMB, pages: null, chars: 0, sentChars: 0, level: "over", reason: `超过 ${FILE_LIMITS.HARD_SIZE_MB}MB 硬上限` }
+    };
+  }
+
+  // Count PDF pages if applicable (before extracting text — cheap)
+  if (ext === "pdf") {
+    try {
+      const buf = await new Promise((res, rej) => {
+        const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(new Error("Read failed")); r.readAsArrayBuffer(file);
+      });
+      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      pages = pdf.numPages;
+      let fullText = "";
+      for (let i = 1; i <= pages; i++) {
+        const page = await pdf.getPage(i);
+        const pc = await page.getTextContent();
+        fullText += pc.items.map(it => it.str || "").join(" ") + "\n\n";
+      }
+      const clean = fullText.trim();
+      const content = clean.length > 20 ? cleanFileText(clean) : "[PDF appears to be scanned/image-based. Please OCR first or paste text manually.]";
+      const chars = content.startsWith("[") ? 0 : content.length;
+      const sentChars = Math.min(chars, FILE_LIMITS.PER_PAPER_SENT);
+      const level = getFileLevel({ sizeMB, pages, chars });
+      return {
+        content,
+        meta: { sizeMB, pages, chars, sentChars, level, reason: content.startsWith("[") ? "扫描版,无法提取文字" : null }
+      };
+    } catch (e) {
+      return {
+        content: "[PDF reading failed: " + (e.message || "unknown") + ". Please copy-paste text manually.]",
+        meta: { sizeMB, pages, chars: 0, sentChars: 0, level: "over", reason: "PDF 读取失败" }
+      };
+    }
+  }
+
+  // Other file types: reuse the legacy extractor
+  const content = await readFileAsText(file);
+  const isError = content.startsWith("[");
+  const chars = isError ? 0 : content.length;
+  const sentChars = Math.min(chars, FILE_LIMITS.PER_PAPER_SENT);
+  const level = isError ? "over" : getFileLevel({ sizeMB, pages: null, chars });
+  return {
+    content,
+    meta: { sizeMB, pages: null, chars, sentChars, level, reason: isError ? content.slice(1, 60) : null }
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // 龙爪手创新宪法 · 平台永久记忆 (v1.1 扩编版)
 // Innovation Constitution - Permanent Knowledge Base
 // Source: 《龙爪手：以SDE本体论为指导的知识创新原理》王德生著（扩编版·34编）
@@ -752,6 +843,222 @@ const REVIEW_E3_CN = `你是中文核心期刊审稿专家,聚焦【创新与价
 2. 不足(2-3 点)
 3. 修改建议(2-3 条)
 结尾必须有:SCORE: [数字]`;
+
+// ── 9. 结构化阅读 Prompt(多篇文献输入专用)── 
+// 目标:把一篇 20000 字原文压缩成约 3000 字的严格学术阅读笔记
+// 遵循国内学位论文文献综述写作规范 + 国际 Critical Reading 方法
+const PAPER_READER_SYS = `你是严谨的学术论文精读专家。任务:对一篇完整的学术论文进行【结构化精读】,
+输出一份符合国内学位论文文献综述规范的、约 2500-3000 字的学术阅读笔记。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【精读原则 · 必须遵守】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+第一性原则:
+  1. 忠实原文:只记录原文明确陈述的内容,不要推测,不要脑补
+  2. 精确引用:凡涉及数据、定义、结论,必须标注原文页码或章节位置(如"p.15"或"§3.2")
+  3. 原句保留:对关键定义、核心命题、重要数据,保留原文 1-2 句直接引用(用「」标记)
+  4. 术语忠实:原文的专业术语必须精确保留,不能同义替换
+  5. 边界清晰:原文没说的,写"原文未展开"或"原文未说明",绝不自己补
+
+观察维度:
+  ◆ 文本层:作者、标题、出处、发表时间、学科归属
+  ◆ 问题层:研究问题、研究背景、研究动机
+  ◆ 理论层:理论框架、核心概念、概念定义
+  ◆ 方法层:研究设计、数据来源、分析方法、样本
+  ◆ 证据层:具体数据、案例、引用的文献、实验结果
+  ◆ 论证层:论证链条、主要论点、支撑证据、论证结构
+  ◆ 结论层:主要发现、学术贡献、实践意涵
+  ◆ 反思层:局限性、未来研究、潜在批评
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【输出格式 · 严格 JSON,不含其他文字】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{
+  "bibliographic": {
+    "title_zh": "中文标题(英文论文则翻译)",
+    "title_original": "原文标题",
+    "authors": ["作者1","作者2"],
+    "affiliations": ["第一作者单位","第二作者单位"],
+    "year": "发表年份",
+    "journal_or_venue": "期刊/出版源/会议名",
+    "volume_issue_pages": "卷期页码(如 38(4):123-145)",
+    "doi": "DOI 或其他 ID(原文可见则填)",
+    "language": "zh|en|其他",
+    "publication_type": "期刊论文|专著章节|会议论文|学位论文|工作论文|报告",
+    "discipline": "一级学科",
+    "sub_discipline": "二级/三级学科",
+    "citation_gbt7714": "按 GB/T 7714 格式自动生成的规范引用条目"
+  },
+
+  "problem_and_motivation": {
+    "research_question": "该论文要回答的核心研究问题(原文明确表述,一句话)",
+    "background": "研究背景简述(150-200字):学科当前处境、现实背景、已有困境",
+    "motivation": "研究动机:作者为什么做这个研究?在回应什么?填补什么空白?",
+    "stated_gap": "作者明确指出的研究空白(如原文未明说,写'原文未明确陈述')",
+    "significance_claimed": "作者自述的研究意义(理论意义+实践意义分开列)"
+  },
+
+  "theoretical_framework": {
+    "primary_theory": "核心理论/主理论流派",
+    "key_theorists_cited": [
+      {"name":"被反复引用的理论家(如 Bourdieu / 布迪厄)","year":"其被引作品年份","how_used":"该作者的哪个概念被本文使用/批判"}
+    ],
+    "core_concepts": [
+      {
+        "term_zh":"概念中文名",
+        "term_original":"概念原文(英文或原语言)",
+        "author_definition":"作者对该概念的定义(原文直引或忠实转述,150字内)",
+        "prior_source":"该概念是否借用已有学者(如 Foucault 1977),还是本文自创"
+      }
+    ],
+    "paradigm": "研究范式(实证主义|解释主义|批判主义|混合|其他)",
+    "epistemological_stance": "认识论立场(原文若未明说,可填'原文未明确')"
+  },
+
+  "methodology": {
+    "research_design": "研究设计类型(量化|质性|混合|文献研究|理论建构|案例研究|其他)",
+    "specific_method": "具体方法(如'半结构化访谈+扎根理论编码'或'多元回归分析')",
+    "data_source": "数据/材料来源(如'2022 年 CFPS 数据'或'广州 M 区 30 位教师访谈')",
+    "sample_or_corpus": "样本规模/语料规模(如 N=342 教师 或 128 份政策文本)",
+    "sampling_strategy": "抽样策略(随机|目的|雪球|理论|便利|不适用)",
+    "analytic_procedure": "分析步骤(2-3 句说清分析流程)",
+    "instruments_or_tools": "所用工具/量表/软件(如 NVivo 12|SPSS 26|问卷名称)",
+    "validity_reliability": "作者如何保证信效度(如'三角验证'|'成员检核'|'量表 α=0.87')",
+    "ethical_considerations": "伦理审查说明(若原文提及)"
+  },
+
+  "findings": {
+    "main_findings_list": [
+      {
+        "seq": 1,
+        "finding": "主要发现 1 的精确陈述(原文忠实表述)",
+        "supporting_evidence": "支撑该发现的关键数据或案例(带原文数字/引文)",
+        "location_in_text": "在原文哪一节/哪一页(如 §4.2 或 p.142)"
+      }
+    ],
+    "key_statistics_or_quotes": [
+      "关键数据/引用原句 1(保留原文数字单位,如'实验组后测平均分 78.4,对照组 65.2,p<.001')",
+      "关键引用 2(用「」包裹原文直引)"
+    ],
+    "unexpected_findings": "意外发现(原文专门讨论的意料之外的结果)",
+    "author_interpretation": "作者对发现的解释(100-150字)"
+  },
+
+  "argumentation_structure": {
+    "central_thesis": "论文的中心论点(一句话,30 字内)",
+    "main_argument_chain": [
+      "步骤 1:作者首先论证 X",
+      "步骤 2:然后通过 Y 证明 Z",
+      "步骤 3:最终得出 W"
+    ],
+    "logical_structure_type": "演绎|归纳|类比|辩证|混合",
+    "how_evidence_links_to_claim": "证据如何被用于支撑论点(关键论证技术)",
+    "counterarguments_addressed": "作者是否预见并回应了潜在反驳?(原文如未处理则填'未处理')"
+  },
+
+  "contributions": {
+    "theoretical_contribution": "理论贡献(作者自述+你的判断,100字内)",
+    "methodological_contribution": "方法论贡献(如提出新量表|新方法|新数据库)",
+    "empirical_contribution": "实证贡献(填补何种具体空白)",
+    "practical_implications": "实践启示(对政策|实务|教学的建议,逐条列)",
+    "novelty_assessment": "创新度评估(1-10):该论文相比已有研究的新颖程度"
+  },
+
+  "limitations_and_gaps": {
+    "self_stated_limitations": ["作者自己承认的局限 1","局限 2"],
+    "observed_gaps": "精读者(你)观察到但作者未充分讨论的局限(论证弱点|样本偏差|概念漏洞)",
+    "unaddressed_questions": ["本文未回答但与之相关的问题 1","问题 2"],
+    "replicability": "可复现性评估(高|中|低)+简要理由"
+  },
+
+  "position_in_field": {
+    "relation_to_prior_work": "该论文与已有研究的关系(继承|发展|批判|综合|对话)",
+    "key_prior_works_cited": ["被本文当作基础的关键前作 1(作者+年)","关键前作 2","关键前作 3"],
+    "debates_engaged": "该论文介入的学术争论(若有)",
+    "citation_network_snapshot": "从参考文献看该论文所处的学术网络特征(如'主要对话对象是欧美社会学家')"
+  },
+
+  "quality_assessment": {
+    "rigor": {"score": 1-10, "reason": "评分理由一句话"},
+    "innovation": {"score": 1-10, "reason": "..."},
+    "clarity": {"score": 1-10, "reason": "..."},
+    "evidence_strength": {"score": 1-10, "reason": "..."},
+    "theoretical_depth": {"score": 1-10, "reason": "..."},
+    "overall": {"score": 1-10, "verdict": "重要经典|可靠参考|仅供了解|质量存疑"}
+  },
+
+  "usage_for_new_research": {
+    "directly_citable_claims": [
+      "可直接在新论文中引用的具体陈述 1(含原文页码,如'本文 p.142 指出...')",
+      "可引用陈述 2"
+    ],
+    "borrowable_concepts": ["可借用的核心概念 1","概念 2"],
+    "borrowable_methods": ["可借鉴的方法 1"],
+    "borrowable_data_points": ["可引用的具体数据 1(如'教育部 2022 年数据:XX%')"],
+    "best_suited_for_topics": ["此论文最适合用来支撑哪类主题的研究,标签 1","标签 2","标签 3"]
+  },
+
+  "reader_summary": {
+    "one_sentence_summary": "用一句话概括整篇论文(含问题-方法-结论)",
+    "three_sentence_summary": "三句话概括(问题+方法+结论,每句完整可独立),不超过 150 字",
+    "core_takeaway": "作为后续研究的参考,此文最值得带走的一个认识(50 字内)"
+  }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【字数与深度要求】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- 整份 JSON 的所有文本字段加起来,应达到约 2500-3000 字
+- 不要字段冗余空洞;每个字段都要有实质内容
+- 如原文确实未涉及某字段,填写"原文未涉及"或空数组 [];不要编造
+- 重点字段(theoretical_framework, findings, argumentation_structure)字数应多
+- 次要字段(bibliographic, quality_assessment)可简洁
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【严格禁令】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+× 绝不编造原文没有的数据、人名、年份、结论
+× 绝不把你的观点混入作者的观点
+× 绝不使用 AI 套语("综上所述"、"不难看出"、"众所周知"等)
+× 绝不省略 JSON 的必填字段;即便原文未涉及,也要显式标注"原文未涉及"
+× 绝不输出 Markdown 代码块围栏(\`\`\`json);直接输出纯 JSON 对象`;
+
+// ── 缓存工具函数 · localStorage + 内容 hash ──
+// 用 SHA-1 对文件原始内容做 hash,相同内容的文件命中相同缓存
+async function hashContent(text) {
+  try {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(text);
+    const buf = await crypto.subtle.digest("SHA-1", data);
+    const arr = Array.from(new Uint8Array(buf));
+    return arr.map(b => b.toString(16).padStart(2, "0")).join("");
+  } catch (e) {
+    // Fallback: simple string hash
+    let h = 0;
+    for (let i = 0; i < text.length; i++) {
+      h = (h * 31 + text.charCodeAt(i)) | 0;
+    }
+    return "fb" + Math.abs(h).toString(16);
+  }
+}
+
+// 缓存命名空间:paper_struct:{hash}
+const PAPER_CACHE_PREFIX = "paper_struct:";
+async function getPaperFromCache(hash) {
+  try {
+    const r = await window.storage.get(PAPER_CACHE_PREFIX + hash);
+    if (r && r.value) return JSON.parse(r.value);
+  } catch (e) { /* silent */ }
+  return null;
+}
+async function savePaperToCache(hash, structured) {
+  try {
+    await window.storage.set(PAPER_CACHE_PREFIX + hash, JSON.stringify(structured));
+    return true;
+  } catch (e) { return false; }
+}
 
 const SDE_SYS = `You operate within SDE (Structure-Difference-Entanglement) ontological genesis methodology by Desheng Wang (王德生). SDE is NOT a "framework" or "tool"—it is the operational law of how any existence discloses itself. Everything below is your thinking substrate. Internalize it; do not merely reference it.
 
@@ -1568,7 +1875,8 @@ export default function App(){
   const t=T[lang];const lf=lang==="zh"?"Chinese":"English";
 
   // Papers Input
-  const[inputPapers,setInputPapers]=useState([]); // [{name,content}]
+  // Each item: {id, name, content, summary?, status: 'loading'|'loaded'|'summarizing'|'summarized'|'error'}
+  const[inputPapers,setInputPapers]=useState([]);
   const[paText,setPaText]=useState(""); // for paste
   const[paBusy,setPaBusy]=useState(false);const[paLogs,setPaLogs]=useState([]);
   const[paResult,setPaResult]=useState(null);const[paPhase,setPaPhase]=useState("");
@@ -1843,19 +2151,94 @@ Language: ${lf}.`;
   const safeName=p=>(p?.title||"paper").replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g,"_").substring(0,40);
 
   // ═══ PAPERS INPUT & ANALYSIS ═══
+  // Enhanced: UUID-based matching (fixes same-name collision bug),
+  // per-file metadata (sizeMB/pages/chars/level), and dropped-files warning
+  // 升级:读文件后自动调用结构化阅读,带缓存(命中零成本)
   const handleFileUpload=async(files)=>{
-    const MAX_SIZE=20*1024*1024; // 20MB
-    const fileArr=Array.from(files).slice(0,20-inputPapers.length);
-    for(const file of fileArr){
+    const MAX_PAPERS=20;
+    const remainSlots=MAX_PAPERS-inputPapers.length;
+    const fileArr=Array.from(files);
+    const willProcess=fileArr.slice(0,remainSlots);
+    const dropped=fileArr.slice(remainSlots);
+
+    // If user dropped more than we can take, warn immediately
+    if(dropped.length>0){
+      const warnMsg=lang==="zh"
+        ?`⚠️ 已达 ${MAX_PAPERS} 篇上限。已跳过 ${dropped.length} 个文件:${dropped.map(f=>f.name).join(", ")}`
+        :`⚠️ Reached ${MAX_PAPERS} paper limit. Skipped ${dropped.length} files: ${dropped.map(f=>f.name).join(", ")}`;
+      setInputPapers(p=>[...p,{id:"warn_"+Date.now(),name:"⚠️ Upload Limit",content:warnMsg,meta:{level:"warn",chars:0,sizeMB:0}}].slice(0,MAX_PAPERS));
+    }
+
+    for(const file of willProcess){
+      const jobId=(crypto.randomUUID?crypto.randomUUID():("id_"+Date.now()+"_"+Math.random().toString(36).slice(2)));
       const name=file.name;
-      if(file.size>MAX_SIZE){setInputPapers(p=>[...p,{name:name+" [TOO LARGE]",content:`[File exceeds 20MB limit: ${(file.size/1024/1024).toFixed(1)}MB]`}].slice(0,20));continue;}
-      // Show loading state
-      setInputPapers(p=>[...p,{name:name+" ⏳",content:"[Loading...]"}].slice(0,20));
+      const sizeMB=+(file.size/1024/1024).toFixed(2);
+
+      // Stage 1: Show loading placeholder (reading file)
+      setInputPapers(p=>[...p,{
+        id:jobId,
+        name:name+" ⏳",
+        content:"[Reading file...]",
+        meta:{sizeMB,pages:null,chars:0,sentChars:0,level:"unknown",reason:null},
+        structured:null,
+        cacheHit:false
+      }].slice(0,MAX_PAPERS));
+
       try{
-        const content=await readFileAsText(file);
-        setInputPapers(p=>p.map(pp=>pp.name===name+" ⏳"?{name,content}:pp));
+        // Stage 1: Parse file -> text
+        const {content,meta}=await readFileAsTextMeta(file);
+        setInputPapers(p=>p.map(pp=>pp.id===jobId?{
+          ...pp,
+          name:name+" 🔍",
+          content,
+          meta
+        }:pp));
+
+        // Stage 2: Structured reading with cache
+        // Only if content is valid (not error/too-large)
+        if(content && !content.startsWith("[") && content.trim().length>200){
+          const hash=await hashContent(content);
+          let structured=await getPaperFromCache(hash);
+          const fromCache=!!structured;
+
+          if(!structured){
+            // Cache miss — call DeepSeek to extract structured summary
+            const readerPrompt=`【原文·${content.length} 字】\n\n${content.substring(0,FILE_LIMITS.PER_PAPER_SENT)}\n\n请按系统提示词的规范,对该论文进行结构化精读,输出完整 JSON。`;
+            try{
+              const rawRes=await api(readerPrompt, PAPER_READER_SYS, 8000, null, DEEPSEEK_MODEL);
+              structured=parseJSONSafe(rawRes, null);
+              if(structured){
+                await savePaperToCache(hash, structured);
+              }
+            }catch(e){
+              console.warn("Structured reading failed:", e.message);
+            }
+          }
+
+          setInputPapers(p=>p.map(pp=>pp.id===jobId?{
+            ...pp,
+            name: meta.level==="over" ? (name+" ⚠️") : (structured ? (name+(fromCache?" 💾":" ✅")) : (name+" ⚡")),
+            content,
+            meta,
+            structured,
+            cacheHit:fromCache
+          }:pp));
+        } else {
+          // File read failed or empty — show as-is, no structured reading
+          setInputPapers(p=>p.map(pp=>pp.id===jobId?{
+            ...pp,
+            name:meta.level==="over"?name+" ⚠️":name,
+            content,
+            meta
+          }:pp));
+        }
       }catch(e){
-        setInputPapers(p=>p.map(pp=>pp.name===name+" ⏳"?{name:name+" ❌",content:"[Error: "+e.message+"]\n\nTip: "+(name.endsWith(".pdf")?"PDF reading requires API access. Try copy-pasting the text instead.":"Try saving as .docx or copy-pasting the text.")}:pp));
+        setInputPapers(p=>p.map(pp=>pp.id===jobId?{
+          ...pp,
+          name:name+" ❌",
+          content:"[Error: "+e.message+"]",
+          meta:{sizeMB,pages:null,chars:0,sentChars:0,level:"over",reason:e.message}
+        }:pp));
       }
     }
     if(paFileRef.current)paFileRef.current.value="";
@@ -1863,11 +2246,20 @@ Language: ${lf}.`;
   const addPastedText=()=>{
     if(!paText.trim())return;
     const parts=paText.split(/\n===+\n|\n---+\n/).filter(p=>p.trim().length>20);
+    const makeMeta=(c)=>{
+      const chars=c.length;
+      const level=chars>FILE_LIMITS.WARN_CHARS?"over":chars>FILE_LIMITS.SAFE_CHARS?"warn":"safe";
+      return {sizeMB:+(chars/1024/1024*2).toFixed(2),pages:null,chars,sentChars:Math.min(chars,FILE_LIMITS.PER_PAPER_SENT),level,reason:null};
+    };
     if(parts.length>1){
-      const newPapers=parts.slice(0,20-inputPapers.length).map((p,i)=>({name:`Pasted ${inputPapers.length+i+1}`,content:p.trim()}));
+      const newPapers=parts.slice(0,20-inputPapers.length).map((p,i)=>{
+        const c=p.trim();
+        return {id:"paste_"+Date.now()+"_"+i,name:`Pasted ${inputPapers.length+i+1}`,content:c,meta:makeMeta(c)};
+      });
       setInputPapers(prev=>[...prev,...newPapers].slice(0,20));
     }else{
-      setInputPapers(prev=>[...prev,{name:`Pasted ${prev.length+1}`,content:paText.trim()}].slice(0,20));
+      const c=paText.trim();
+      setInputPapers(prev=>[...prev,{id:"paste_"+Date.now(),name:`Pasted ${prev.length+1}`,content:c,meta:makeMeta(c)}].slice(0,20));
     }
     setPaText("");
   };
@@ -1890,8 +2282,35 @@ Language: ${lf}.`;
     const ctrl=new AbortController();paAbort.current=ctrl;const sig=ctrl.signal;
     setPaBusy(true);setPaLogs([]);setPaResult(null);setPaPhase("...");
     const add=(r,x)=>{setPaLogs(p=>[...p,{role:r,text:x}]);};
-    const digest=valid.map((p,i)=>`[Paper ${i+1}: ${p.name}]\n${p.content.substring(0,2000)}`).join("\n\n---\n\n");
-    add("sys",`◉ ${t.papersTitle} | ${valid.length} ${lang==="zh"?"篇可分析":"valid papers"} | ${digest.length} chars`);
+    // 升级:优先使用结构化精读结果(3000 字/篇),缓存命中零成本
+    // 兜底:未结构化则退回原文前 3000 字
+    const structuredCount=valid.filter(p=>p.structured).length;
+    const cachedCount=valid.filter(p=>p.cacheHit).length;
+    const digest=valid.map((p,i)=>{
+      if(p.structured){
+        // 用结构化精读结果(~2500-3000 字/篇,高信息密度)
+        const s=p.structured;
+        const bib=s.bibliographic||{};
+        const findings=(s.findings&&s.findings.main_findings_list)||[];
+        const concepts=(s.theoretical_framework&&s.theoretical_framework.core_concepts)||[];
+        const stats=(s.findings&&s.findings.key_statistics_or_quotes)||[];
+        return `[Paper ${i+1}] ${bib.title_zh||bib.title_original||p.name} (${(bib.authors||[]).join(",")} ${bib.year||""})
+【来源】${bib.journal_or_venue||""} · ${bib.discipline||""}
+【研究问题】${(s.problem_and_motivation&&s.problem_and_motivation.research_question)||"未提取"}
+【理论框架】${(s.theoretical_framework&&s.theoretical_framework.primary_theory)||""} | 核心概念:${concepts.map(c=>c.term_zh||c.term_original).filter(Boolean).join("、")}
+【研究方法】${(s.methodology&&s.methodology.specific_method)||""} | 样本:${(s.methodology&&s.methodology.sample_or_corpus)||""}
+【主要发现】${findings.map((f,j)=>`(${j+1})${f.finding||""}`).join(" ")}
+【关键数据】${stats.slice(0,3).join(" | ")}
+【中心论点】${(s.argumentation_structure&&s.argumentation_structure.central_thesis)||""}
+【理论贡献】${(s.contributions&&s.contributions.theoretical_contribution)||""}
+【局限】${(s.limitations_and_gaps&&s.limitations_and_gaps.self_stated_limitations||[]).join("; ")}
+【在领域中的位置】${(s.position_in_field&&s.position_in_field.relation_to_prior_work)||""}`;
+      } else {
+        // 兜底:原文截断(提升到 3000 字,保留更多细节)
+        return `[Paper ${i+1}: ${p.name}]\n${(p.content||"").substring(0,3000)}`;
+      }
+    }).join("\n\n═══════════════════════════════\n\n");
+    add("sys",`◉ ${t.papersTitle} | ${valid.length} ${lang==="zh"?"篇可分析":"valid"} | ${structuredCount} ${lang==="zh"?"篇已结构化精读":"structured"} (${cachedCount} ${lang==="zh"?"缓存命中":"cached"}) | ${digest.length} chars`);
 
     try{
       if(sig.aborted)throw new DOMException("","AbortError");
