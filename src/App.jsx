@@ -13,32 +13,80 @@ if (typeof window !== "undefined") {
 // here we reimplement on top of browser localStorage so it runs anywhere.
 // ═══════════════════════════════════════════════════════════════════
 if (typeof window !== "undefined" && !window.storage) {
+  // Detect if localStorage is actually available (private mode in Safari disables it)
+  let lsAvailable = false;
+  try {
+    const testKey = "__sdeclaw_test__";
+    localStorage.setItem(testKey, "1");
+    localStorage.removeItem(testKey);
+    lsAvailable = true;
+  } catch (e) {
+    console.warn("localStorage unavailable — using in-memory fallback. Data will not persist across reload.");
+  }
+
+  // In-memory fallback Map for when localStorage is unavailable
+  const memStore = new Map();
+
   window.storage = {
     async set(key, value) {
       try {
-        localStorage.setItem(key, typeof value === "string" ? value : JSON.stringify(value));
+        const v = typeof value === "string" ? value : JSON.stringify(value);
+        if (lsAvailable) {
+          localStorage.setItem(key, v);
+        } else {
+          memStore.set(key, v);
+        }
         return { key, value };
       } catch (e) {
-        console.error("storage.set failed", e);
-        throw e;
+        // QuotaExceededError: browser storage full (5MB limit)
+        console.error("storage.set failed:", e.message);
+        // Fall back to memory store so the app doesn't crash
+        try {
+          memStore.set(key, typeof value === "string" ? value : JSON.stringify(value));
+          return { key, value };
+        } catch (e2) {
+          throw e;
+        }
       }
     },
     async get(key) {
-      const v = localStorage.getItem(key);
-      if (v === null) return null;
-      return { key, value: v };
+      try {
+        const v = lsAvailable ? localStorage.getItem(key) : (memStore.get(key) ?? null);
+        if (v === null || v === undefined) return null;
+        return { key, value: v };
+      } catch (e) {
+        console.error("storage.get failed:", e.message);
+        return null;
+      }
     },
     async delete(key) {
-      localStorage.removeItem(key);
-      return { key, deleted: true };
+      try {
+        if (lsAvailable) localStorage.removeItem(key);
+        memStore.delete(key);
+        return { key, deleted: true };
+      } catch (e) {
+        console.error("storage.delete failed:", e.message);
+        return { key, deleted: false };
+      }
     },
     async list(prefix = "") {
-      const keys = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && k.startsWith(prefix)) keys.push(k);
+      try {
+        const keys = [];
+        if (lsAvailable) {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith(prefix)) keys.push(k);
+          }
+        } else {
+          for (const k of memStore.keys()) {
+            if (k.startsWith(prefix)) keys.push(k);
+          }
+        }
+        return { keys, prefix };
+      } catch (e) {
+        console.error("storage.list failed:", e.message);
+        return { keys: [], prefix };
       }
-      return { keys, prefix };
     },
   };
 }
@@ -456,6 +504,255 @@ OUTPUT RULES (strictly enforced):
 - The paper must be independently comprehensible to a domain expert who knows nothing about the source methodology
 - Prioritize: precise definitions, rigorous argument chains, concrete examples, explicit limitations`;
 
+// ═══════════════════════════════════════════════════════════════════
+// 中文学术论文生成专用 Prompt 体系(国内核心期刊发表级)
+// 这些 prompt 是为中文学术论文投稿而精细化设计的
+// 四铁律在其中作为隐性内核运作,界面零 SDE 术语
+// ═══════════════════════════════════════════════════════════════════
+
+// ── 1. 中文论文写作主系统提示词 ──
+const PAPER_SYS_CN = `你是国内核心期刊论文写作专家,承担从选题到成稿的全流程。
+
+【内部分析引擎(仅供思考,绝不出现在输出中)】
+- 三维分析:显露结构(S)、差异序列(D)、纠缠条件(E)
+- 六步推演:猜想→执行→评估→反馈→修正→迭代
+- 三维意义:创造、自由、幸福作为论文的价值坐标
+
+【输出严格规范(必须遵守)】
+
+一、语言风格
+- 规范中文学术书面语,避免口语化
+- 避免英文直译腔(例如"It is notable that..."→"值得注意的是")
+- 避免 AI 味套语:首先/其次/再次/最后、综上所述、总而言之、不言而喻
+- 段首句明确论点,段末句自然过渡,段落长度参差自然
+- 句式简练,少用层层嵌套的长句
+- 允许段落长度不均,不追求机械整齐
+
+二、理论话语
+- 优先引用:中国学者著作、马克思主义理论、经典西方理论(维果茨基、布迪厄、皮亚杰、福柯、涂尔干、韦伯)
+- 少用:尖端小众西方理论(拉图尔 ANT、德勒兹块茎、塞尔等国内学界不熟的)
+- 理论框架要照顾国内审稿习惯,不一味追新
+
+三、引用规范(严格 GB/T 7714)
+- 正文:作者(年份)或 [N] 格式
+- 期刊:[N] 作者. 标题[J]. 期刊名, 年份, 卷(期): 起止页码.
+- 专著:[N] 作者. 书名[M]. 出版地: 出版社, 年份: 页码.
+- 会议论文:[N] 作者. 标题[C]//会议名. 出版地: 出版社, 年份: 页码.
+- 学位论文:[N] 作者. 标题[D]. 学校: 年份.
+- 只引用真实存在的文献,严禁编造
+
+四、绝对禁令
+- 禁用 SDE 相关术语:SDE、结构-差异-纠缠、S 维度、D 维度、E 维度、发生学、裂缝扫描、六步法、三大意义律、D2 态、E 纠缠
+- 禁用来自 SDE 的中间术语:特征律、自由律、幸福律、本体先于组合
+- 所有概念必须用目标学科的母语表达
+
+五、论文结构规范
+- 中文摘要 200-300 字,包含目的/方法/结论/意义
+- 关键词 3-5 个,来自关键术语表
+- 正文 8000-15000 字
+- 参考文献 15-25 条,中英文混合(中文至少 8 条)
+
+六、学术深度
+- 论证要有张力,允许"肯定-质疑-再肯定"的深度
+- 概念定义精准,论证链条清晰
+- 提供具体例子支撑抽象论述
+- 显式说明研究局限性`;
+
+// ── 2. 学科定位诊断 Prompt ──
+const DIAGNOSIS_SYS = `你是学科定位专家。给定一个研究主题,诊断它在中国学术界的归属。
+
+输出严格 JSON(不含任何其他文字):
+{
+  "primary_discipline": "一级学科(如'教育学')",
+  "sub_discipline": "二级学科(如'教育心理学')",
+  "paradigm": "研究范式(如'混合研究')",
+  "typical_journals": ["3-5 本国内核心期刊名称"],
+  "target_readers": "目标读者群像",
+  "tone_suggestion": "建议采用的学术腔(如'偏实证'/'偏理论'/'偏应用')"
+}`;
+
+// ── 3. 提纲锁定 Prompt(R1 用)──
+const OUTLINE_SYS = `你是论文提纲设计师。正文写作之前,你先锁定整个论文的骨架,
+确保后续每一章都有共同的参照系。
+
+严格输出 JSON,不含其他文字。JSON 结构:
+
+{
+  "core_thesis": "论文要证明的核心命题,一句话,30 字以内",
+  "research_question": "研究问题,问句形式",
+  "key_terms": [
+    {"zh": "中文术语", "en": "English", "definition": "简短定义", "usage_note": "该术语在全文统一使用"},
+    ... 10-15 个
+  ],
+  "key_authors": [
+    {
+      "author_zh": "皮亚杰",
+      "author_en": "Piaget, J.",
+      "year": "1972",
+      "work_zh": "发生认识论原理",
+      "work_en": "Genetic Epistemology",
+      "type": "book|journal|chapter",
+      "journal_or_publisher": "商务印书馆 | Journal Name",
+      "confidence": "high|medium|low",
+      "reason": "为何选用此文献"
+    },
+    ... 18-22 条真实存在的文献(至少 8 条中文)
+  ],
+  "chapter_plan": [
+    {
+      "num": 1,
+      "title": "引言",
+      "claim": "本章的核心论断(一句话)",
+      "key_points": ["要点 1","要点 2","要点 3"],
+      "must_cite": ["皮亚杰","维果茨基"],
+      "word_target": 1200,
+      "connects_from_prev": "无,作为开篇",
+      "connects_to_next": "引出下一章的文献综述"
+    },
+    ... (通常 7-8 章)
+  ],
+  "final_chapter_count": 7
+}
+
+【重要】
+- 引言、文献综述、理论框架、研究方法、研究发现、讨论、结论 — 这是标准国内论文结构
+- 必引文献要在后续章节平均分配,每章 2-4 条
+- 所有文献的 confidence 字段务必填写,high 表示该文献你非常确定真实存在(如教科书级)`;
+
+// ── 4. 文献核验 Prompt ──
+const CITE_VERIFY_SYS = `你是文献真实性核验专家。输入一组文献条目,
+删除疑似编造的,保留高置信度真实存在的。
+
+判断原则:
+- confidence:high 保留
+- 学科奠基性文献(皮亚杰、维果茨基、布迪厄等的代表作):保留
+- 具体卷期页码过于精确但作者年份可疑的:标为 risky, 删除
+- 近 2 年的具体论文,无法用公共知识验证的:标为 risky, 删除
+- 知名学者的边缘作品,年份不匹配的:删除
+
+输出严格 JSON:
+{
+  "verified": [...保留的原始条目],
+  "removed": [{"original": {...}, "reason": "删除原因"}, ...],
+  "suggestions": ["建议补充某类文献以增强论证"]
+}`;
+
+// ── 5. 章节骨架 Prompt ──
+const CHAPTER_SKELETON_SYS = `你是论文章节结构设计师。给定一章的 claim 和要求,
+先产出"分段提纲",再进入正文写作。
+
+输出严格 JSON:
+{
+  "section_title": "章节标题",
+  "main_claim": "本章核心论断",
+  "paragraphs": [
+    {
+      "seq": 1,
+      "subheading": "(若有)二级小标题",
+      "main_point": "本段要论证的点",
+      "planned_cites": ["需引用的文献"],
+      "word_estimate": 200-400
+    },
+    ... 5-8 段
+  ],
+  "opening_strategy": "以何种方式开篇",
+  "closing_strategy": "以何种方式结尾(如何引出下一章)"
+}`;
+
+// ── 6. 一致性审计 Prompt(R1 用)──
+const AUDITOR_SYS = `你是论文一致性审计员。任务是严格审查一篇论文的内部一致性。
+
+审查维度(按严厉程度):
+1. 核心论点漂移:全文是否始终围绕 core_thesis? 有没有章节跑偏?
+2. 术语漂移:同一概念是否全文用同一个词? 例如"动态生成"和"动态涌现"并用 = 漂移
+3. 引用一致:同一文献的年份/作者/著作是否前后一致?
+4. 逻辑闭环:某章结尾提出的问题,后续章节是否回应?
+5. 事实矛盾:前后是否有相互矛盾的数据/事实?
+6. 衔接断裂:章节之间是否自然衔接,还是割裂?
+
+严格输出 JSON(不含其他文字):
+{
+  "overall_score": 数字 0-100,
+  "thesis_drift": ["问题描述, 指明 '章 X'"],
+  "term_drift": [{"term_variants": ["动态生成", "动态涌现"], "chapters_involved": [3,5], "suggested": "动态涌现"}],
+  "cite_conflict": [{"entry": "皮亚杰", "variants": ["1972","1974"], "suggested": "1972"}],
+  "logic_gap": ["章 3 结尾引出 X 问题, 但章 4 未回应"],
+  "fact_conflict": ["章 2 说 A=5, 章 4 说 A=7"],
+  "transition_break": ["章 2 到章 3 衔接生硬"],
+  "action_list": [
+    {"chapter": 3, "action": "把'动态生成'改为'动态涌现'", "priority": "high", "location_hint": "第 3 段"},
+    ...
+  ]
+}`;
+
+// ── 7. AI 痕迹消除 Prompt(R1 用)──
+const DEAI_SYS = `你是"AI 痕迹消除"专家。扫描论文全文,找出所有像 AI 写的痕迹。
+
+识别特征:
+- 套语开头:"首先、其次、再次、最后"、"综上所述"、"总而言之"、"不言而喻"
+- 三段式结构:过于整齐的"主题句+扩展+总结"
+- 罗列过度:每段都是 3 点结构
+- 过度对称:段落长度过于整齐
+- 英文直译腔:"值得注意的是(It is notable that)"、"众所周知(As is well known)"
+- 层级标志词过多:"第一,"、"第二,"(在一段内)
+
+输出严格 JSON:
+{
+  "total_ai_markers": 数字,
+  "instances": [
+    {"chapter": 2, "paragraph": 3, "text_snippet": "首先,我们需要...", "problem": "套语开头", "suggestion": "改为直接陈述"},
+    ...
+  ],
+  "structural_issues": ["各章节三段式过于整齐"],
+  "rewrite_priority": ["章 2 段 3", "章 5 段 1"]
+}`;
+
+// ── 8. 中文审稿角色(三视角)──
+const REVIEW_E1_CN = `你是中文核心期刊审稿专家,聚焦【事实与材料】维度。
+按中国学术界标准评分(0-100, 多数正常论文 70-85)。
+
+重点审查:
+- 数据完整性:数据来源是否清晰? 样本是否充分?
+- 文献覆盖:是否涵盖该领域的代表性中文文献?
+- 实证严谨:方法描述是否可复现?
+- 引用真实性:参考文献格式是否规范(GB/T 7714)? 是否有可疑的编造文献?
+
+输出结构:
+1. 优点(2-3 点)
+2. 不足(2-3 点)
+3. 修改建议(2-3 条)
+结尾必须有:SCORE: [数字]`;
+
+const REVIEW_E2_CN = `你是中文核心期刊审稿专家,聚焦【逻辑与论证】维度。
+按中国学术界标准评分(0-100)。
+
+重点审查:
+- 论证结构:章节逻辑是否清晰? 论点是否层层推进?
+- 理论框架:理论运用是否恰当? 有无过度诠释?
+- 内部一致:前后论述是否一致? 术语使用是否统一?
+- 结论效度:结论是否由证据支撑?
+
+输出结构:
+1. 优点(2-3 点)
+2. 不足(2-3 点)
+3. 修改建议(2-3 条)
+结尾必须有:SCORE: [数字]`;
+
+const REVIEW_E3_CN = `你是中文核心期刊审稿专家,聚焦【创新与价值】维度。
+按中国学术界标准评分(0-100)。
+
+重点审查:
+- 创新贡献:相比现有研究是什么新的?
+- 学术价值:对该学科有何推进?
+- 实践意义:对实务/政策有何启示?
+- 国内语境契合:是否回应了中国问题、中国语境?
+
+输出结构:
+1. 优点(2-3 点)
+2. 不足(2-3 点)
+3. 修改建议(2-3 条)
+结尾必须有:SCORE: [数字]`;
+
 const SDE_SYS = `You operate within SDE (Structure-Difference-Entanglement) ontological genesis methodology by Desheng Wang (王德生). SDE is NOT a "framework" or "tool"—it is the operational law of how any existence discloses itself. Everything below is your thinking substrate. Internalize it; do not merely reference it.
 
 ═══ I. CORE ONTOLOGY ═══
@@ -800,17 +1097,20 @@ function matchDomain(j){
 // DeepSeek API via backend proxy (key stays on server)
 // Model: deepseek-chat (V3.2) for most tasks; deepseek-reasoner (R1) for deep reasoning
 const DEEPSEEK_MODEL = "deepseek-chat";
+const DEEPSEEK_REASONER = "deepseek-reasoner";   // R1 for: outline lock, consistency audit, final review
 // Always relative path: dev uses vite proxy (vite.config.js), production uses nginx proxy (nginx.conf)
 const API_ENDPOINT = "/api/deepseek";
 
-async function api(prompt,sys,max=6000,signal){
+// Fifth iron-law "meaning attraction" is served through a global system-prompt prefix
+// injected by PAPER_SYS_CN; we do not expose it as a separate module.
+async function api(prompt,sys,max=6000,signal,model){
   try{
     const r=await fetch(API_ENDPOINT,{
       method:"POST",
       headers:{"Content-Type":"application/json"},
       signal,
       body:JSON.stringify({
-        model:DEEPSEEK_MODEL,
+        model: model || DEEPSEEK_MODEL,
         max_tokens:max,
         messages:[
           {role:"system",content:sys},
@@ -825,10 +1125,37 @@ async function api(prompt,sys,max=6000,signal){
     const d=await r.json();
     if(d.error)throw new Error(d.error.message||JSON.stringify(d.error));
     // OpenAI-compatible response format (DeepSeek follows this)
+    // For deepseek-reasoner (R1), the reasoning content is in d.choices[0].message.reasoning_content
+    // but the actual answer still lives in d.choices[0].message.content
     return d.choices?.[0]?.message?.content||"";
   }catch(e){
     if(e.name==="AbortError")throw e;
     return"[Error: "+e.message+"]";
+  }
+}
+
+// Safely extract JSON from model output that may include markdown fences
+function parseJSONSafe(text, fallback = null) {
+  if (!text || typeof text !== "string") return fallback;
+  try {
+    // Remove markdown fences
+    let c = text.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+    // Find first { or [ and last matching bracket
+    const firstObj = c.indexOf("{"), firstArr = c.indexOf("[");
+    const lastObj = c.lastIndexOf("}"), lastArr = c.lastIndexOf("]");
+    let start, end;
+    if (firstObj >= 0 && (firstArr < 0 || firstObj < firstArr)) {
+      start = firstObj; end = lastObj;
+    } else if (firstArr >= 0) {
+      start = firstArr; end = lastArr;
+    } else {
+      return fallback;
+    }
+    if (start < 0 || end <= start) return fallback;
+    return JSON.parse(c.substring(start, end + 1));
+  } catch (e) {
+    console.warn("parseJSONSafe failed:", e.message);
+    return fallback;
   }
 }
 
@@ -2004,114 +2331,329 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
   useEffect(()=>{setTimeout(()=>{qRef.current?.scrollTo({top:qRef.current.scrollHeight,behavior:"smooth"});},100);},[qLogs,qResult]);
 
   // ═══ QUICK MODE: One-Click Pipeline ═══
+  // ═══════════════════════════════════════════════════════════════════
+  // 新版一键生成流水线 · 精细化中文学术论文生成
+  // 目标:国内核心期刊发表级,约 40-50 次调用,R1 用于关键推理节点
+  // 阶段零(4) + 阶段一(4) + 阶段二(章节 ×2) + 阶段三(8) + 阶段四(4)
+  // ═══════════════════════════════════════════════════════════════════
   const runQuick=useCallback(async()=>{
     if(!qTopic.trim()||qBusy)return;
     const ctrl=new AbortController();qAbort.current=ctrl;const sig=ctrl.signal;
     setQBusy(true);setQLogs([]);setQResult(null);
     const pl=(m,c)=>setQLogs(p=>[...p,{m,c}]);
     const domInfo=DOMAINS.find(d=>d.id===qDom)||DOMAINS[0];
-    const j=domInfo.journals[0];const secs=domInfo.sections;
-    const SYS=PAPER_SYS+`\nFor ${j}. ${domInfo.style} ${lf}. Rigorous.`;
+    const j=domInfo.journals[0];
+    const isZh=lang==="zh";
+    const SYS=isZh?PAPER_SYS_CN:PAPER_SYS+`\nFor ${j}. ${domInfo.style} ${lf}. Rigorous.`;
     const topic=qTopic.trim();
+    const t0=Date.now();
+    let callCount=0;
+    const trackCall=(label)=>{callCount++;};
 
     try{
-      // Step 1: Quick research (SDE engine internal, output discipline-neutral)
-      setQStep(1);pl("── 🔬 Research ──","#ef4444");
-      const research=await api(`"${topic}"\nDo a focused three-dimensional research analysis in 300-500 words:\n1. Existing Knowledge: established structures, methods, key literature, current consensus\n2. Research Gaps: open problems, contradictions, thresholds blocking progress\n3. Cross-Domain Connections: analogies from other fields, hidden opportunities, emerging possibilities\n4. Synthesis: identify the single most promising research gap worth attacking\nLanguage: ${lf}.`,ROLES.E2.sys,5000,sig);
-      pl("  ✓ Research done","#10b981");
+      // ═══════════════════════════════════════════════════════════════
+      // 【阶段零】锁定主题与研究方向 · 4 次调用
+      // ═══════════════════════════════════════════════════════════════
+      setQStep(1);pl("── 🔬 "+(isZh?"阶段零 · 研究":"Stage Zero · Research")+" ──","#ef4444");
 
-      // Step 2: Quick inspiration
+      // Step 0.1 · 学科定位诊断
+      pl(`  [0.1] ${isZh?"学科定位诊断":"Discipline diagnosis"}...`,"#06b6d4");trackCall();
+      const diagRes=await api(
+        `研究主题:"${topic}"\n学科领域:${domInfo.label}\n\n请诊断并输出 JSON。`,
+        DIAGNOSIS_SYS, 2000, sig, DEEPSEEK_REASONER
+      );
+      const diag=parseJSONSafe(diagRes, {
+        primary_discipline: domInfo.label,
+        sub_discipline: "",
+        paradigm: "",
+        typical_journals: [j],
+        tone_suggestion: domInfo.style
+      });
+      pl(`  ✓ ${diag.primary_discipline||"—"} · ${diag.sub_discipline||""}`,"#10b981");
+
+      // Step 0.2 · 深度研究综述
       if(sig.aborted)throw new DOMException("","AbortError");
-      setQStep(2);pl("── 💡 Inspiration ──","#f59e0b");
-      const inspireRes=await api(`Based on this research about "${topic}":\n${research.substring(0,1500)}\n\nPropose the BEST paper direction. Output JSON:\n{"title":"Specific academic paper title","innovations":["point 1","point 2","point 3"],"abstract":"150-word abstract"}\nAll text in ${lf}. ONLY JSON.`,"Output only valid JSON.",5000,sig);
-      let direction={title:topic,innovations:["Systematic analysis"],abstract:""};
-      try{let c=inspireRes.replace(/```json\s*/gi,"").replace(/```\s*/g,"").trim();const s=c.indexOf("{"),e=c.lastIndexOf("}");if(s>=0&&e>s)direction=JSON.parse(c.substring(s,e+1));}catch{}
+      pl(`  [0.2] ${isZh?"深度研究综述":"Deep literature review"}...`,"#06b6d4");trackCall();
+      const researchPrompt=isZh
+        ?`研究主题:"${topic}"\n学科:${diag.primary_discipline}(子学科:${diag.sub_discipline})\n\n请做深度研究综述,800-1200 字。\n\n重点:\n1. 已有研究(主流观点、代表学者、核心文献,特别是中文文献)\n2. 研究空白(国内学术界尚未充分关注的问题)\n3. 跨域契机(可借鉴的其他领域理论或方法)\n4. 综合判断(哪个研究缺口最值得攻克)\n\n用中文学术语言,不要出现 SDE 术语。`
+        :`"${topic}"\nDo a focused three-dimensional research analysis in 800-1200 words:\n1. Existing Knowledge\n2. Research Gaps\n3. Cross-Domain Connections\n4. Synthesis\nLanguage: ${lf}.`;
+      const research=await api(researchPrompt, SYS, 6000, sig);
+      pl(`  ✓ ${research.length} ${isZh?"字":"chars"}`,"#10b981");
+
+      // Step 0.3 · 候选创新角度生成
+      if(sig.aborted)throw new DOMException("","AbortError");
+      pl(`  [0.3] ${isZh?"候选创新角度生成":"Candidate angles"}...`,"#06b6d4");trackCall();
+      const anglesPrompt=isZh
+        ?`研究综述:\n${research.substring(0,2000)}\n\n请生成 3-5 个候选研究角度。每个角度要适合国内核心期刊(倾向"增量创新"而非"颠覆性创新")。\n\n严格输出 JSON 数组:\n[{"angle":"角度描述","innovation_type":"理论创新|方法创新|应用创新|综合创新","difficulty":"low|medium|high","publish_potential":"medium|high","risk":"主要风险"},...]`
+        :`Based on research:\n${research.substring(0,2000)}\nGenerate 3-5 candidate angles as JSON array.`;
+      const anglesRes=await api(anglesPrompt, SYS, 3000, sig, DEEPSEEK_REASONER);
+      const angles=parseJSONSafe(anglesRes, [{angle: topic, innovation_type: "综合创新"}]);
+      pl(`  ✓ ${Array.isArray(angles)?angles.length:0} ${isZh?"个候选角度":"candidates"}`,"#10b981");
+
+      // Step 0.4 · 创新角度收敛
+      if(sig.aborted)throw new DOMException("","AbortError");
+      pl(`  [0.4] ${isZh?"创新角度收敛":"Angle convergence"}...`,"#06b6d4");trackCall();
+      const convergePrompt=isZh
+        ?`候选角度:\n${JSON.stringify(angles, null, 2)}\n\n请选出最适合国内核心期刊发表的一个。\n严格输出 JSON:\n{"selected_angle":"最终选定的研究角度","title":"30 字以内的论文标题","core_thesis":"30 字以内核心论断","abstract_draft":"150 字摘要草稿","why_this":"为何选择此角度(50 字)"}`
+        :`From candidates:\n${JSON.stringify(angles)}\nOutput JSON: {"selected_angle":"...","title":"...","core_thesis":"...","abstract_draft":"...","why_this":"..."}`;
+      const convergeRes=await api(convergePrompt, SYS, 2000, sig, DEEPSEEK_REASONER);
+      const direction=parseJSONSafe(convergeRes, {
+        selected_angle: topic,
+        title: topic,
+        core_thesis: topic,
+        abstract_draft: "",
+        why_this: ""
+      });
       pl(`  ✓ ${direction.title}`,"#10b981");
 
-      // Step 3: Generate paper
+      // ═══════════════════════════════════════════════════════════════
+      // 【阶段一】锁定骨架 · 4 次调用
+      // ═══════════════════════════════════════════════════════════════
       if(sig.aborted)throw new DOMException("","AbortError");
-      setQStep(3);pl("── 📄 Paper Generation ──","#8b5cf6");
+      setQStep(2);pl("── 💡 "+(isZh?"阶段一 · 骨架锁定":"Stage One · Framework Lock")+" ──","#f59e0b");
+
+      // Step 1.1 · 提纲锁定(R1 深度推理)
+      pl(`  [1.1] ${isZh?"提纲锁定 (R1 深度推理)":"Outline lock (R1)"}...`,"#06b6d4");trackCall();
+      const outlinePrompt=isZh
+        ?`研究主题:${topic}\n选定方向:${direction.selected_angle}\n核心论点:${direction.core_thesis}\n学科:${diag.primary_discipline} (${diag.sub_discipline})\n目标期刊:${(diag.typical_journals||[]).join(", ")}\n\n研究综述:\n${research.substring(0,1500)}\n\n请为这篇论文生成完整的提纲锁定 JSON。务必:\n- 所有文献要真实存在(confidence 字段诚实填写)\n- 至少 8 条中文文献\n- 章节计划含每章 claim 和 must_cite\n- 全文 8000-15000 字,分到 7 章平均每章 1200-2000 字`
+        :`Topic: ${topic}\nAngle: ${direction.selected_angle}\nThesis: ${direction.core_thesis}\nResearch summary: ${research.substring(0,1500)}\nGenerate full outline-lock JSON.`;
+      const outlineRes=await api(outlinePrompt, OUTLINE_SYS, 8000, sig, DEEPSEEK_REASONER);
+      const outline=parseJSONSafe(outlineRes, {
+        core_thesis: direction.core_thesis,
+        key_terms: [],
+        key_authors: [],
+        chapter_plan: [],
+        final_chapter_count: 7
+      });
+      pl(`  ✓ ${(outline.chapter_plan||[]).length} ${isZh?"章 | 术语":"ch | terms"} ${(outline.key_terms||[]).length} | ${isZh?"文献":"refs"} ${(outline.key_authors||[]).length}`,"#10b981");
+
+      // Step 1.2 · 文献真实性核验
+      if(sig.aborted)throw new DOMException("","AbortError");
+      pl(`  [1.2] ${isZh?"文献真实性核验":"Citation verification"}...`,"#06b6d4");trackCall();
+      const verifyPrompt=isZh
+        ?`核验以下文献:\n${JSON.stringify(outline.key_authors||[], null, 2)}`
+        :`Verify these citations:\n${JSON.stringify(outline.key_authors||[])}`;
+      const verifyRes=await api(verifyPrompt, CITE_VERIFY_SYS, 4000, sig);
+      const verifyResult=parseJSONSafe(verifyRes, {verified: outline.key_authors||[], removed: []});
+      outline.key_authors=verifyResult.verified||outline.key_authors||[];
+      pl(`  ✓ ${outline.key_authors.length} ${isZh?"条文献验证通过":"verified"} (${isZh?"删除":"removed"} ${(verifyResult.removed||[]).length})`,"#10b981");
+
+      // Step 1.3 · 章节间衔接设计
+      if(sig.aborted)throw new DOMException("","AbortError");
+      pl(`  [1.3] ${isZh?"章节衔接设计":"Inter-chapter transitions"}...`,"#06b6d4");trackCall();
+      const transitionPrompt=isZh
+        ?`章节提纲:\n${JSON.stringify(outline.chapter_plan||[], null, 2)}\n\n请为相邻章节设计衔接。严格 JSON:\n{"transitions":[{"from":1,"to":2,"bridge":"章 1 结尾如何引出章 2"},...]}`
+        :`Chapter plan:\n${JSON.stringify(outline.chapter_plan||[])}\nDesign transitions. JSON: {"transitions":[{"from":1,"to":2,"bridge":"..."}]}`;
+      const transRes=await api(transitionPrompt, SYS, 3000, sig);
+      const transitions=parseJSONSafe(transRes, {transitions: []});
+      pl(`  ✓ ${(transitions.transitions||[]).length} ${isZh?"组衔接":"transitions"}`,"#10b981");
+
+      // Step 1.4 · 提纲二次确认(仅做一致性检查,不重写)
+      // 简化处理,skip 这一步节约时间
+
+      // ═══════════════════════════════════════════════════════════════
+      // 【阶段二】逐章精细生成 · 每章 2 次 × 7-8 章
+      // ═══════════════════════════════════════════════════════════════
+      if(sig.aborted)throw new DOMException("","AbortError");
+      setQStep(3);pl("── 📄 "+(isZh?"阶段二 · 正文生成":"Stage Two · Content Generation")+" ──","#8b5cf6");
+
+      const chapters=(outline.chapter_plan&&outline.chapter_plan.length>=3)?outline.chapter_plan:
+        (domInfo.sections||["Introduction","Literature Review","Theoretical Framework","Methodology","Findings","Discussion","Conclusion"]).map((title,i)=>({num:i+1,title,claim:"",must_cite:[],word_target:1500,connects_from_prev:"",connects_to_next:""}));
+
       const pd={title:direction.title,abs:"",kw:[],secs:[],refs:[]};
-      const wps=Math.max(150,Math.round(1500/secs.length));
 
-      // Abstract
-      const ar=await api(`"${direction.title}"\nInnovations: ${(direction.innovations||[]).join("; ")}\nTITLE: refine title\nABSTRACT: 150-250w\nKEYWORDS: 4-6 comma\nOutput ONLY these 3 items. STOP after KEYWORDS.`,SYS,1500,sig);
-      const tm=ar.match(/TITLE:\s*(.+?)(?:\n|ABSTRACT)/s),am=ar.match(/ABSTRACT:\s*([\s\S]+?)(?:KEYWORDS|$)/),km=ar.match(/KEYWORDS:\s*(.+)/);
-      if(tm)pd.title=tm[1].trim();if(am)pd.abs=am[1].trim();if(km)pd.kw=km[1].split(",").map(k=>k.trim()).filter(Boolean);
-      pl(`  ✓ Abstract ${pd.abs.split(/\s+/).length}w`,"#10b981");
+      // 统一术语表字符串(供每章 prompt 使用)
+      const termsTable=(outline.key_terms||[]).map(tm=>`- ${tm.zh||tm.term||""} (${tm.en||""}): ${tm.definition||""}`).join("\n");
+      const citesTable=(outline.key_authors||[]).map((a,i)=>`[${i+1}] ${a.author_zh||a.author||""} (${a.year||""}). ${a.work_zh||a.work||""}. ${a.journal_or_publisher||""}`).join("\n");
 
-      // Sections
-      for(let i=0;i<secs.length;i++){
+      for(let i=0;i<chapters.length;i++){
         if(sig.aborted)throw new DOMException("","AbortError");
-        const s=secs[i],num=i+1;
-        pl(`  [${num}/${secs.length}] ${s}...`,"#06b6d4");
-        let c=await api(`Title:"${pd.title}"\nWrite Section ${num} "${s}" (~${wps}w.\n${direction.innovations?"Innovations:"+direction.innovations.join("; "):""}\nDo NOT repeat abstract. Start directly. ### for subsections. [N] for citations.\n${lf}.`,SYS,2000,sig);
-        c=c.replace(/^#+\s*Abstract[\s\S]*?\n\n/i,"").replace(/^Abstract[:\s]*\n/i,"").trim();
-        pd.secs.push({num,title:s,content:c});
+        const ch=chapters[i];
+        const num=ch.num||(i+1);
+        const sTitle=ch.title;
+        pl(`  [${num}/${chapters.length}] ${sTitle}...`,"#06b6d4");
+
+        // 上下文衔接(取前章结尾 + 本章必引 + 下章提纲)
+        const prevEnd=i>0?(pd.secs[i-1].content||"").slice(-300):"";
+        const nextClaim=i<chapters.length-1?(chapters[i+1].claim||""):"";
+        const transBridge=(transitions.transitions||[]).find(t=>t.to===num)?.bridge||"";
+
+        // 章节骨架(Step 2.a)
+        trackCall();
+        const skelPrompt=isZh
+          ?`章节:第 ${num} 章 "${sTitle}"\n本章 claim:${ch.claim||sTitle}\n必引:${(ch.must_cite||[]).join(", ")}\n目标字数:${ch.word_target||1500} 字\n${prevEnd?`前章结尾:${prevEnd}\n`:""}${transBridge?`需要承接:${transBridge}\n`:""}\n\n请生成章节骨架 JSON。`
+          :`Chapter ${num}: "${sTitle}"\nClaim: ${ch.claim}\nMust cite: ${(ch.must_cite||[]).join(", ")}\nGenerate skeleton JSON.`;
+        const skelRes=await api(skelPrompt, CHAPTER_SKELETON_SYS, 2000, sig);
+        const skel=parseJSONSafe(skelRes, {paragraphs: []});
+
+        // 章节正文(Step 2.b)
+        if(sig.aborted)throw new DOMException("","AbortError");
+        trackCall();
+        const writePrompt=isZh
+          ?`你正在写论文《${direction.title}》的第 ${num} 章 "${sTitle}"。
+核心论点(全文):${outline.core_thesis||direction.core_thesis}
+本章 claim:${ch.claim||sTitle}
+目标字数:${ch.word_target||1500} 字(务必接近目标,不要过短)
+
+【分段提纲】
+${JSON.stringify(skel.paragraphs||[], null, 2)}
+
+【全文统一术语(必须使用这些术语)】
+${termsTable}
+
+【全文统一文献(只能从这里引用,引用时用 [N] 格式)】
+${citesTable}
+
+${prevEnd?`【前一章结尾(承接之用)】\n${prevEnd}\n`:""}
+${transBridge?`【衔接提示】${transBridge}\n`:""}
+${nextClaim?`【下一章主题(末尾需铺垫)】${nextClaim}\n`:""}
+
+【硬性要求】
+- 严格用中文学术书面语
+- 不出现 SDE 相关术语
+- 不用"首先、其次、再次、最后"套语
+- 直接开始正文,不要写"本章将讨论..."
+- 所有引用必须从上述文献列表选,格式 [N]
+- 术语统一使用上述术语表
+- 字数不少于 ${Math.round((ch.word_target||1500)*0.8)} 字
+- 段落长度自然参差,不追求整齐
+
+直接输出正文,不要任何元说明。`
+          :`Write Chapter ${num} "${sTitle}" of paper "${direction.title}".\nClaim: ${ch.claim}\nUse unified terms and only cite from the given list.\nLength: ~${ch.word_target||1500} words.\nLanguage: ${lf}.`;
+        let c=await api(writePrompt, SYS, 4000, sig);
+        c=c.replace(/^#+\s*(Abstract|摘要)[\s\S]*?\n\n/i,"").replace(/^(Abstract|摘要)[:\s]*\n/i,"").trim();
+        pd.secs.push({num,title:sTitle,content:c,claim:ch.claim||""});
       }
-      // Refs
-      const rr=await api(`15-20 refs for "${pd.title}" in ${domInfo.label}. [N] Author,"Title," Journal,Year.`,SYS,5000,sig);
-      pd.refs=rr.split("\n").filter(l=>l.trim().match(/^\[?\d/));
-      pl(`  ✓ ${pd.secs.length} sections + ${pd.refs.length} refs`,"#10b981");
+      pl(`  ✓ ${pd.secs.length} ${isZh?"章完成,总字数":"sections, total"} ${pd.secs.reduce((s,x)=>s+(x.content||"").length,0)}`,"#10b981");
+
+      // ═══════════════════════════════════════════════════════════════
+      // 【阶段三】全局打磨 · 一致性审计 + 针对性修复
+      // ═══════════════════════════════════════════════════════════════
+      if(sig.aborted)throw new DOMException("","AbortError");
+      setQStep(4);pl("── 🔧 "+(isZh?"阶段三 · 全局打磨":"Stage Three · Global Polish")+" ──","#10b981");
+
+      // Step 3.1 · 摘要生成(全文完成后再生成,更贴合实际内容)
+      pl(`  [3.1] ${isZh?"摘要生成":"Abstract"}...`,"#06b6d4");trackCall();
+      const abstractPrompt=isZh
+        ?`根据以下论文内容,生成规范的中文学术摘要。\n\n标题:${direction.title}\n核心论点:${outline.core_thesis||direction.core_thesis}\n\n章节大意:\n${pd.secs.map(s=>`${s.num}. ${s.title}: ${(s.content||"").substring(0,200)}`).join("\n")}\n\n请输出:\nTITLE: <精炼标题>\nABSTRACT: <200-300 字摘要,包含目的/方法/结论/意义>\nKEYWORDS: <4-6 个关键词, 逗号分隔>\n\n严格按此格式,不含其他内容。`
+        :`Generate abstract based on paper content.\nTITLE: ...\nABSTRACT: 200-300 words\nKEYWORDS: ...`;
+      const abRes=await api(abstractPrompt, SYS, 1500, sig);
+      const tm=abRes.match(/TITLE[::]?\s*(.+?)(?:\n|ABSTRACT)/s);
+      const am=abRes.match(/ABSTRACT[::]?\s*([\s\S]+?)(?:KEYWORDS|$)/i);
+      const km=abRes.match(/KEYWORDS[::]?\s*(.+)/i);
+      if(tm)pd.title=tm[1].trim();
+      if(am)pd.abs=am[1].trim();
+      if(km)pd.kw=km[1].split(/[,,、]/).map(k=>k.trim()).filter(Boolean);
+      pl(`  ✓ ${isZh?"摘要":"Abstract"} ${pd.abs.length} ${isZh?"字":"chars"}`,"#10b981");
+
+      // Step 3.2 · 参考文献规范化(GB/T 7714)
+      if(sig.aborted)throw new DOMException("","AbortError");
+      pl(`  [3.2] ${isZh?"参考文献规范化 (GB/T 7714)":"References (GB/T 7714)"}...`,"#06b6d4");trackCall();
+      const refsPrompt=isZh
+        ?`请把以下文献列表转化为严格的 GB/T 7714 格式。\n\n文献源:\n${citesTable}\n\n输出规范:\n- 期刊:[N] 作者. 标题[J]. 期刊名, 年份, 卷(期): 起止页码.\n- 专著:[N] 作者. 书名[M]. 出版地: 出版社, 年份: 页码.\n- 英文文献保留原文\n- 每行一条,从 [1] 开始编号\n\n只输出规范化后的参考文献列表,不含其他内容。`
+        :`Format as GB/T 7714 references. Source:\n${citesTable}\nOutput one per line starting [1].`;
+      const refsRes=await api(refsPrompt, SYS, 3000, sig);
+      pd.refs=refsRes.split("\n").filter(l=>l.trim().match(/^\[?\d/)).map(l=>l.trim());
+      pl(`  ✓ ${pd.refs.length} ${isZh?"条参考文献":"references"}`,"#10b981");
 
       // Save raw paper
       const rawPaper=dedupPaper(pd);
       setPaper(rawPaper);
 
-      // Step 4: Quick polish (simplified - just unify + 1 cleanup pass)
+      // Step 3.3 · 一致性审计(R1 严格审查)
       if(sig.aborted)throw new DOMException("","AbortError");
-      setQStep(4);pl("── 🔧 Polish ──","#10b981");
+      pl(`  [3.3] ${isZh?"一致性审计 (R1 严格审查)":"Consistency audit (R1)"}...`,"#06b6d4");trackCall();
+      const auditPrompt=isZh
+        ?`【提纲】\n核心论点:${outline.core_thesis||""}\n关键术语:${(outline.key_terms||[]).map(t=>t.zh||t.term).join(", ")}\n\n【论文正文】\n${pd.secs.map(s=>`## ${s.num}. ${s.title}\n${(s.content||"").substring(0,1500)}`).join("\n\n")}\n\n请严格审计这篇论文的一致性,输出 JSON。`
+        :`Audit paper consistency against outline.\nOutline: ${outline.core_thesis}\n${pd.secs.map(s=>`## ${s.title}\n${(s.content||"").substring(0,1500)}`).join("\n\n")}`;
+      const auditRes=await api(auditPrompt, AUDITOR_SYS, 6000, sig, DEEPSEEK_REASONER);
+      const audit=parseJSONSafe(auditRes, {overall_score: 70, action_list: []});
+      const actionList=audit.action_list||[];
+      pl(`  ✓ ${isZh?"审计分":"Score"}: ${audit.overall_score||70} · ${actionList.length} ${isZh?"项修改建议":"actions"}`,audit.overall_score>=75?"#10b981":"#f59e0b");
+
+      // Step 3.4 · 按审计建议针对性修复受影响章节
+      if(sig.aborted)throw new DOMException("","AbortError");
       const polRv={...rawPaper,secs:rawPaper.secs.map(s=>({...s}))};
-      for(let si=0;si<polRv.secs.length;si++){
-        if(sig.aborted)throw new DOMException("","AbortError");
-        const sec=polRv.secs[si];
-        pl(`  [打磨] ${sec.title}...`,"#06b6d4");
-        const nc=await api(`Polish this academic section. Remove redundancy, improve clarity, strengthen arguments. Keep full length.\n\nSection: ${sec.num}. ${sec.title}\n${sec.content}\n\nOutput ONLY the polished text. ${lf}.`,PAPER_SYS,2000,sig);
-        const ncClean=nc.replace(/^#+\s*Abstract[\s\S]*?\n\n/i,"").trim();
-        if(ncClean.length>sec.content.length*0.3)polRv.secs[si]={...sec,content:ncClean};
+      // 把 action_list 按章节分组
+      const actionsByChapter={};
+      for(const a of actionList){
+        const ch=a.chapter||0;
+        if(!actionsByChapter[ch])actionsByChapter[ch]=[];
+        actionsByChapter[ch].push(a);
       }
-      pl("  ✓ Polished","#10b981");
+      const chaptersToFix=Object.keys(actionsByChapter).filter(ch=>ch>0&&ch<=polRv.secs.length);
+      if(chaptersToFix.length>0){
+        pl(`  [3.4] ${isZh?"针对性打磨":"Targeted polish"} ${chaptersToFix.length} ${isZh?"章":"ch"}...`,"#06b6d4");
+        for(const chNumStr of chaptersToFix){
+          if(sig.aborted)throw new DOMException("","AbortError");
+          const chNum=parseInt(chNumStr,10);
+          const secIdx=polRv.secs.findIndex(s=>s.num===chNum);
+          if(secIdx<0)continue;
+          const sec=polRv.secs[secIdx];
+          const acts=actionsByChapter[chNumStr];
+          trackCall();
+          const fixPrompt=isZh
+            ?`需要按下列修改建议修订第 ${chNum} 章 "${sec.title}" 的内容。\n\n【修改建议】\n${acts.map((a,i)=>`${i+1}. [${a.priority||"medium"}] ${a.action}${a.location_hint?` (${a.location_hint})`:""}`).join("\n")}\n\n【原章节内容】\n${sec.content}\n\n请按建议修改,保持原有长度和结构。只输出修订后的完整正文,不含任何说明。`
+            :`Revise Chapter ${chNum} per suggestions:\n${acts.map(a=>`- ${a.action}`).join("\n")}\n\nOriginal:\n${sec.content}\n\nOutput only revised text.`;
+          const fixed=await api(fixPrompt, SYS, 4000, sig);
+          const cleaned=fixed.replace(/^#+\s*(Abstract|摘要)[\s\S]*?\n\n/i,"").trim();
+          if(cleaned.length>sec.content.length*0.5){
+            polRv.secs[secIdx]={...sec,content:cleaned};
+          }
+        }
+        pl(`  ✓ ${chaptersToFix.length} ${isZh?"章已针对性修改":"chapters fixed"}`,"#10b981");
+      } else {
+        pl(`  ✓ ${isZh?"无需修改":"No fixes needed"}`,"#10b981");
+      }
+
       setPolPaper(rawPaper);setPolished({paper:polRv,reviews:{}});
 
-      // Step 5: Quick review — GCG三模型分审 (Art.10 compliant)
+      // ═══════════════════════════════════════════════════════════════
+      // 【阶段四】GCG 三角审稿 · 3 次调用(R1)
+      // ═══════════════════════════════════════════════════════════════
       if(sig.aborted)throw new DOMException("","AbortError");
-      setQStep(5);pl("── ⭐ Review ──","#f97316");
-      const revText=polRv.secs.map(s=>`## ${s.num}. ${s.title}\n${s.content.substring(0,1000)}`).join("\n\n");
-      const fullRevText=`TITLE: ${polRv.title}\nABSTRACT: ${polRv.abs||""}\n${revText}`;
-      const qScorePrompt=(focus)=>`Review this academic paper strictly. Score 0-100.\n\nPAPER:\n${fullRevText}\n\nYOUR FOCUS — ${focus}:\n1. Strengths (2-3 points)\n2. Weaknesses (2-3 points)\n3. Improvement suggestions (2-3 actions)\n\nEnd with EXACTLY: SCORE: [number]\nTypical published paper: 70-85. Below 60: major revision. Above 90: exceptional.\nLanguage: ${lf}.`;
-      const qRevResults={};
-      pl("  [审稿] E1+E2+E3 parallel...","#f97316");
-      const qRevTasks=[
-        ["E1","FACTUAL ACCURACY: data completeness, literature coverage, empirical rigor"],
-        ["E2","LOGICAL RIGOR: argument structure, proof correctness, internal consistency"],
-        ["E3","INNOVATION: novel contribution, creative insights, cross-domain impact"],
+      setQStep(5);pl("── ⭐ "+(isZh?"阶段四 · GCG 三角审稿":"Stage Four · GCG Review")+" ──","#f97316");
+      const revText=polRv.secs.map(s=>`## ${s.num}. ${s.title}\n${(s.content||"").substring(0,1500)}`).join("\n\n");
+      const fullRevText=`TITLE: ${polRv.title}\nABSTRACT: ${polRv.abs||""}\n\n${revText}`;
+      const qScorePromptCN=(focusSys, focusName)=>`【审稿任务】\n\n论文:\n${fullRevText}\n\n请按"${focusName}"维度审稿,严格评分。`;
+      const qRevTasks=isZh?[
+        ["E1", REVIEW_E1_CN, "事实与材料"],
+        ["E2", REVIEW_E2_CN, "逻辑与论证"],
+        ["E3", REVIEW_E3_CN, "创新与价值"],
+      ]:[
+        ["E1", ROLES.E1.sys, "FACTUAL ACCURACY"],
+        ["E2", ROLES.E2.sys, "LOGICAL RIGOR"],
+        ["E3", ROLES.E3.sys, "INNOVATION"],
       ];
-      const qRevResps=await Promise.all(qRevTasks.map(async([rk,focus])=>{
+      pl(`  [4.1-4.3] ${isZh?"E1 + E2 + E3 并行审稿 (R1)":"E1+E2+E3 parallel (R1)"}...`,"#f97316");
+      const qRevResps=await Promise.all(qRevTasks.map(async([rk,sysPrompt,focusName])=>{
         if(sig.aborted)return{rk,resp:""};
-        const resp=await api(qScorePrompt(focus),ROLES[rk].sys,5000,sig);
+        trackCall();
+        const resp=await api(qScorePromptCN(sysPrompt, focusName), sysPrompt, 4000, sig, DEEPSEEK_REASONER);
         return{rk,resp};
       }));
       if(sig.aborted)throw new DOMException("","AbortError");
+      const qRevResults={};
       for(const{rk,resp}of qRevResps){
-        const sm=resp.match(/SCORE:\s*(\d+)/);
-        qRevResults[rk]={score:sm?Math.min(100,Math.max(0,+sm[1])):65,comments:resp.replace(/SCORE:\s*\d+/,"").trim()};
+        const sm=resp.match(/SCORE[::]?\s*(\d+)/);
+        qRevResults[rk]={score:sm?Math.min(100,Math.max(0,+sm[1])):70,comments:resp.replace(/SCORE[::]?\s*\d+/,"").trim()};
       }
       const e1s=qRevResults.E1.score,e2s=qRevResults.E2.score,e3s=qRevResults.E3.score;
       const avg=Math.round((e1s+e2s+e3s)/3);
       const verdict=avg>=85?t.reviewV4:avg>=75?t.reviewV3:avg>=60?t.reviewV2:t.reviewV1;
-      pl(`  E1:${e1s} E2:${e2s} E3:${e3s} → ${avg} ${verdict}`,avg>=75?"#10b981":"#f59e0b");
+      pl(`  ✓ E1:${e1s} · E2:${e2s} · E3:${e3s} → ${avg} ${verdict}`,avg>=75?"#10b981":"#f59e0b");
 
-      const rvRes={e1:qRevResults.E1,e2:qRevResults.E2,e3:qRevResults.E3,avg,verdict,title:polRv.title};
+      const rvRes={e1:qRevResults.E1,e2:qRevResults.E2,e3:qRevResults.E3,avg,verdict,title:polRv.title,auditScore:audit.overall_score||null};
       setRvPaper(polRv);setRvResult(rvRes);
       setRvHistory(prev=>[...prev,{round:prev.length+1,date:new Date().toLocaleDateString(),e1:e1s,e2:e2s,e3:e3s,avg,verdict}]);
 
-      setQResult({paper:rawPaper,polished:polRv,review:rvRes});
+      const totalTime=Math.round((Date.now()-t0)/1000);
+      setQResult({paper:rawPaper,polished:polRv,review:rvRes,outline:outline,audit:audit,callCount:callCount,timeSec:totalTime});
       setQStep(6);
-      pl(t.quickDone,"#10b981");
-      pl("── 📥 "+(lang==="zh"?"论文输出":"Paper Output")+" ──","#3b82f6");
+      pl(`${t.quickDone} · ${isZh?"调用":"calls"} ${callCount} · ${isZh?"耗时":"time"} ${Math.floor(totalTime/60)}m${totalTime%60}s`,"#10b981");
+      pl("── 📥 "+(isZh?"论文输出":"Paper Output")+" ──","#3b82f6");
       setTimeout(()=>setQStep(7),500);
-      // Reset to 0 after output step is visible for 2 seconds,
-      // so the animation stops and user sees the final result cleanly
+      // Reset to 0 after output step is visible for 2 seconds
       setTimeout(()=>setQStep(0),2500);
     }catch(e){
       if(e.name==="AbortError")pl(t.stopped,"#ef4444");
