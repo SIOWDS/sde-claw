@@ -2110,6 +2110,9 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
       pl(t.quickDone,"#10b981");
       pl("── 📥 "+(lang==="zh"?"论文输出":"Paper Output")+" ──","#3b82f6");
       setTimeout(()=>setQStep(7),500);
+      // Reset to 0 after output step is visible for 2 seconds,
+      // so the animation stops and user sees the final result cleanly
+      setTimeout(()=>setQStep(0),2500);
     }catch(e){
       if(e.name==="AbortError")pl(t.stopped,"#ef4444");
       else pl("✗ "+e.message,"#ef4444");
@@ -2679,9 +2682,11 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
               {n:6,icon:"✅",label:lang==="zh"?"完成":"Done",color:"#10b981"},
               {n:7,icon:"📥",label:lang==="zh"?"输出":"Output",color:"#3b82f6"},
             ].map((s,i)=>{
-              const done=qStep>s.n||(qStep>=7&&s.n<=7);
-              const active=qStep===s.n;
-              const pending=qStep<s.n&&qStep<7;
+              // When qResult exists (flow complete), show all steps as done — no animation
+              const allDone=!!qResult;
+              const done=allDone||qStep>s.n||(qStep>=7&&s.n<=7);
+              const active=!allDone&&qStep===s.n&&qStep>0&&qStep<7;
+              const pending=!allDone&&qStep<s.n&&qStep<7;
               return <div key={s.n} style={{display:"flex",alignItems:"center",flex:1}}>
                 <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:2,minWidth:36}}>
                   <div style={{width:28,height:28,borderRadius:14,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,
