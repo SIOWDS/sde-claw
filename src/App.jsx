@@ -3978,9 +3978,9 @@ ${nextClaim?`【下一章主题(末尾需铺垫)】${nextClaim}\n`:""}
         {!paBusy&&!paResult&&<div>
           {/* Batch file upload */}
           <div style={{display:"flex",gap:6,marginBottom:12}}>
-            <div onClick={()=>paFileRef.current?.click()} style={{flex:1,padding:"14px",borderRadius:8,border:"2px dashed rgba(236,72,153,.25)",background:"rgba(236,72,153,.03)",textAlign:"center",cursor:"pointer"}}>
+            <div onClick={()=>paFileRef.current?.click()} onDragOver={e=>{e.preventDefault();e.stopPropagation();e.currentTarget.style.borderColor="rgba(236,72,153,.6)";e.currentTarget.style.background="rgba(236,72,153,.08)";}} onDragEnter={e=>{e.preventDefault();e.stopPropagation();}} onDragLeave={e=>{e.preventDefault();e.stopPropagation();e.currentTarget.style.borderColor="rgba(236,72,153,.25)";e.currentTarget.style.background="rgba(236,72,153,.03)";}} onDrop={e=>{e.preventDefault();e.stopPropagation();e.currentTarget.style.borderColor="rgba(236,72,153,.25)";e.currentTarget.style.background="rgba(236,72,153,.03)";if(e.dataTransfer.files&&e.dataTransfer.files.length>0)handleFileUpload(e.dataTransfer.files);}} style={{flex:1,padding:"14px",borderRadius:8,border:"2px dashed rgba(236,72,153,.25)",background:"rgba(236,72,153,.03)",textAlign:"center",cursor:"pointer",transition:"all .15s"}}>
               <div style={{fontSize:13,fontWeight:600,color:"#ec4899",marginBottom:2}}>{t.uploadFiles}</div>
-              <div style={{fontSize:10,color:"rgba(0,0,0,.8)"}}>max 20 · PDF/Word/TXT</div>
+              <div style={{fontSize:10,color:"rgba(0,0,0,.8)"}}>{lang==="zh"?"最多 20 篇 · 按住 Ctrl 或 Shift 多选 · 或拖拽多个文件到此":"Max 20 · Hold Ctrl/Shift to multi-select · Or drag & drop files"}</div>
             </div>
             <input ref={paFileRef} type="file" multiple accept=".pdf,.docx,.doc,.txt,.md,.tex" style={{display:"none"}} onChange={e=>{if(e.target.files&&e.target.files.length>0)handleFileUpload(e.target.files);}}/>
           </div>
