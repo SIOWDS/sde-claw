@@ -2398,7 +2398,9 @@ Language: ${lf}.`;
             // Cache miss — call DeepSeek to extract structured summary
             const readerPrompt=`【原文·${content.length} 字】\n\n${content.substring(0,FILE_LIMITS.PER_PAPER_SENT)}\n\n请按系统提示词的规范,对该论文进行结构化精读,输出完整 JSON。`;
             try{
-              const rawRes=await api(readerPrompt, PAPER_READER_SYS, 8000, null, null, "gemini", "economy");
+              // W1 精读 · E1 事实捕获层 — Full Premium 升级：Gemini 2.5 Pro
+              // 精读质量决定新思想能否涌现：Flash 可能漏掉 implicit gaps，Pro 能捕获到跨篇纠缠点
+              const rawRes=await api(readerPrompt, PAPER_READER_SYS, 8000, null, null, "gemini", "premium");
               structured=parseJSONSafe(rawRes, null);
               if(structured){
                 await savePaperToCache(hash, structured);
