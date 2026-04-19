@@ -1401,44 +1401,94 @@ function matchDomain(j){
   return"math";
 }
 
-// DeepSeek API via backend proxy (key stays on server)
-// Model: deepseek-chat (V3.2) for most tasks; deepseek-reasoner (R1) for deep reasoning
-const DEEPSEEK_MODEL = "deepseek-chat";
-const DEEPSEEK_REASONER = "deepseek-reasoner";   // R1 for: outline lock, consistency audit, final review
-// Always relative path: dev uses vite proxy (vite.config.js), production uses nginx proxy (nginx.conf)
-const API_ENDPOINT = "/api/deepseek";
+// Backend proxy endpoints (key stays on server)
+// - /api/ai       : GCG multi-provider (Gemini + Claude + GPT) — ONLY endpoint used in global edition
+// - /api/deepseek : legacy path retained on backend for emergency fallback, NOT called by frontend
+const DEEPSEEK_MODEL = "deepseek-chat";           // Reserved constant, no longer invoked by frontend
+const DEEPSEEK_REASONER = "deepseek-reasoner";    // Reserved constant, no longer invoked by frontend
+const API_ENDPOINT = "/api/deepseek";             // Kept for historical compatibility; frontend does not use
+const API_ENDPOINT_MULTI = "/api/ai";
+
+// GCG role → provider mapping (E1 = Gemini reality, E2 = Claude reasoning, E3 = GPT entanglement)
+// Per the Dragon Claw constitution, overseas / GCG edition routes each role to its native provider.
+const GCG_PROVIDER = {
+  gemini:    null,   // uses provider default model (gemini-2.5-pro)
+  anthropic: null,   // uses provider default model (claude-opus-4-7)
+  openai:    null,   // uses provider default model (gpt-4.1)
+};
 
 // Fifth iron-law "meaning attraction" is served through a global system-prompt prefix
 // injected by PAPER_SYS_CN; we do not expose it as a separate module.
-async function api(prompt,sys,max=6000,signal,model){
+//
+// `provider` param: "anthropic" (default, Claude main workhorse) | "openai" (GPT) | "gemini" (Gemini)
+// `tier`     param: "premium" | "balanced" | "economy" (optional)
+//                   If omitted, Worker uses DEFAULT_MODELS (economy baseline).
+// `student_code` is auto-injected from window.__SDE_STUDENT_CODE (set by StudentPanel component)
+// All requests route to /api/ai multi-provider endpoint. DeepSeek is deliberately excluded from
+// the global edition to eliminate geopolitical/compliance risk and preserve GCG purity.
+async function api(prompt,sys,max=6000,signal,model,provider="anthropic",tier){
+  const studentCode = typeof window !== "undefined" ? window.__SDE_STUDENT_CODE : null;
+  const body = {
+    provider,
+    model: model || undefined,
+    tier: tier || undefined,
+    student_code: studentCode || undefined,
+    max_tokens:max,
+    messages:[{role:"system",content:sys},{role:"user",content:prompt}]
+  };
   try{
-    const r=await fetch(API_ENDPOINT,{
+    const r=await fetch(API_ENDPOINT_MULTI,{
       method:"POST",
       headers:{"Content-Type":"application/json"},
       signal,
-      body:JSON.stringify({
-        model: model || DEEPSEEK_MODEL,
-        max_tokens:max,
-        messages:[
-          {role:"system",content:sys},
-          {role:"user",content:prompt}
-        ]
-      })
+      body:JSON.stringify(body)
     });
     if(!r.ok){
       const errText=await r.text().catch(()=>"");
-      throw new Error("API "+r.status+(errText?": "+errText.slice(0,200):""));
+      let parsedErr = null;
+      try { parsedErr = JSON.parse(errText); } catch {}
+      const msg = parsedErr?.error?.message || errText.slice(0, 300);
+      // Dispatch student-related events so UI can respond
+      if (typeof window !== "undefined") {
+        if (r.status === 402) {
+          // Budget hard limit reached
+          window.dispatchEvent(new CustomEvent("sde-student-blocked", { detail: { message: msg } }));
+        } else if (r.status === 401 && msg.includes("student_code required")) {
+          window.dispatchEvent(new CustomEvent("sde-student-required"));
+        } else if (r.status === 403 && msg.includes("Invalid invite code")) {
+          window.dispatchEvent(new CustomEvent("sde-student-invalid"));
+        }
+      }
+      throw new Error("API "+r.status+(msg?": "+msg:""));
     }
     const d=await r.json();
     if(d.error)throw new Error(d.error.message||JSON.stringify(d.error));
-    // OpenAI-compatible response format (DeepSeek follows this)
-    // For deepseek-reasoner (R1), the reasoning content is in d.choices[0].message.reasoning_content
-    // but the actual answer still lives in d.choices[0].message.content
+    // Expose student status to UI (StudentBadge listens for this)
+    if (d.student_status && typeof window !== "undefined") {
+      window.__SDE_STUDENT_STATUS = d.student_status;
+      window.dispatchEvent(new CustomEvent("sde-student-status-update", { detail: d.student_status }));
+    }
     return d.choices?.[0]?.message?.content||"";
   }catch(e){
     if(e.name==="AbortError")throw e;
     return"[Error: "+e.message+"]";
   }
+}
+
+// Helper: mark the current paper as completed (called after W7 pipeline success)
+async function markPaperDone() {
+  const code = typeof window !== "undefined" ? window.__SDE_STUDENT_CODE : null;
+  if (!code) return null;
+  try {
+    const r = await fetch(`/api/student/${encodeURIComponent(code)}/paper-done`, { method: "POST" });
+    if (!r.ok) return null;
+    const d = await r.json();
+    // Trigger StudentBadge refresh
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("sde-paper-done", { detail: d }));
+    }
+    return d;
+  } catch (e) { return null; }
 }
 
 // Safely extract JSON from model output that may include markdown fences
@@ -1467,6 +1517,149 @@ function parseJSONSafe(text, fallback = null) {
 }
 
 function Cp({text,label="Copy"}){const[ok,setOk]=useState(false);return <button onClick={()=>{navigator.clipboard?.writeText(text).catch(()=>{});setOk(true);setTimeout(()=>setOk(false),1500);}} style={{padding:"2px 8px",fontSize:9,borderRadius:3,border:"1px solid #8b5cf630",background:ok?"#10b98110":"#8b5cf608",color:ok?"#10b981":"#8b5cf6",cursor:"pointer",fontFamily:"monospace"}}>{ok?"✓":label}</button>;}
+
+// ═══════════════════════════════════════════════════════════════════════
+// StudentBadge — cost tracking UI for crowdfunded beta cohort
+// Reads/writes window.__SDE_STUDENT_CODE so api() can inject into requests
+// ═══════════════════════════════════════════════════════════════════════
+function StudentBadge({lang}){
+  const[code,setCode]=useState(()=>typeof window!=="undefined"?(localStorage.getItem("sde_student_code")||""):"");
+  const[status,setStatus]=useState(null);
+  const[inputCode,setInputCode]=useState("");
+  const[expanded,setExpanded]=useState(false);
+  const[error,setError]=useState("");
+
+  const fetchStatus=useCallback(async(c)=>{
+    if(!c)return;
+    try{
+      const r=await fetch(`/api/student/${encodeURIComponent(c)}`);
+      if(!r.ok){
+        setError(lang==="zh"?"邀请码无效":"Invalid code");
+        return;
+      }
+      const d=await r.json();
+      setStatus(d);
+      setError("");
+    }catch(e){setError(lang==="zh"?"查询失败":"Query failed");}
+  },[lang]);
+
+  useEffect(()=>{
+    if(code){
+      window.__SDE_STUDENT_CODE=code;
+      fetchStatus(code);
+    }
+  },[code,fetchStatus]);
+
+  useEffect(()=>{
+    const handler=(e)=>{
+      setStatus(prev=>prev?{...prev,spent_usd:e.detail.spent_usd,remaining_usd:e.detail.remaining_usd,warning:e.detail.warning}:prev);
+    };
+    const blockedHandler=()=>{
+      if(code)fetchStatus(code);  // refresh on block to show red state
+    };
+    const paperDoneHandler=()=>{
+      if(code)fetchStatus(code);  // refresh on paper completion
+    };
+    const invalidHandler=()=>{
+      setError(lang==="zh"?"邀请码已失效":"Code invalid");
+      logout();
+    };
+    window.addEventListener("sde-student-status-update",handler);
+    window.addEventListener("sde-student-blocked",blockedHandler);
+    window.addEventListener("sde-paper-done",paperDoneHandler);
+    window.addEventListener("sde-student-invalid",invalidHandler);
+    return()=>{
+      window.removeEventListener("sde-student-status-update",handler);
+      window.removeEventListener("sde-student-blocked",blockedHandler);
+      window.removeEventListener("sde-paper-done",paperDoneHandler);
+      window.removeEventListener("sde-student-invalid",invalidHandler);
+    };
+  },[code,fetchStatus,lang]);
+
+  function enter(){
+    const c=inputCode.trim();
+    if(!c)return;
+    localStorage.setItem("sde_student_code",c);
+    window.__SDE_STUDENT_CODE=c;
+    setCode(c);
+    setInputCode("");
+    fetchStatus(c);
+  }
+
+  function logout(){
+    localStorage.removeItem("sde_student_code");
+    window.__SDE_STUDENT_CODE=null;
+    setCode("");
+    setStatus(null);
+    setExpanded(false);
+  }
+
+  // Not logged in → hidden by default (single-user beta mode)
+  // Activate via: localStorage.setItem("sde_show_login", "1") then reload
+  if(!code){
+    const showLogin = typeof window !== "undefined" && localStorage.getItem("sde_show_login") === "1";
+    if (!showLogin) return null;
+    return <div style={{display:"flex",gap:4,alignItems:"center"}}>
+      <input value={inputCode} onChange={e=>setInputCode(e.target.value)} placeholder={lang==="zh"?"邀请码":"Invite code"} style={{padding:"3px 8px",fontSize:11,borderRadius:4,border:"1px solid rgba(139,92,246,.2)",width:100,outline:"none"}} onKeyDown={e=>{if(e.key==="Enter")enter();}}/>
+      <button onClick={enter} disabled={!inputCode.trim()} style={{padding:"3px 8px",fontSize:10,fontWeight:700,borderRadius:4,border:"none",background:inputCode.trim()?"linear-gradient(135deg,#8b5cf6,#06b6d4)":"rgba(0,0,0,.1)",color:inputCode.trim()?"#fff":"rgba(0,0,0,.3)",cursor:inputCode.trim()?"pointer":"default"}}>{lang==="zh"?"进入":"Enter"}</button>
+      {error&&<span style={{fontSize:9,color:"#ef4444"}}>{error}</span>}
+    </div>;
+  }
+
+  if(!status)return <span style={{fontSize:10,color:"rgba(0,0,0,.4)"}}>···</span>;
+
+  const pct=Math.min(100,(status.spent_usd/status.hard_limit_usd)*100);
+  const barColor=status.blocked?"#ef4444":status.warning?"#f59e0b":"#10b981";
+  const papersPct=status.papers_target?Math.min(100,(status.papers_completed/status.papers_target)*100):0;
+
+  return <div style={{position:"relative"}}>
+    <div onClick={()=>setExpanded(!expanded)} style={{display:"flex",gap:6,alignItems:"center",padding:"3px 8px",borderRadius:6,background:"rgba(139,92,246,.05)",border:"1px solid rgba(139,92,246,.15)",cursor:"pointer",transition:"background .15s"}} onMouseEnter={e=>e.currentTarget.style.background="rgba(139,92,246,.1)"} onMouseLeave={e=>e.currentTarget.style.background="rgba(139,92,246,.05)"}>
+      <span style={{fontSize:10,fontWeight:700,color:"#8b5cf6",maxWidth:80,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{status.name||status.code}</span>
+      <div style={{width:50,height:5,borderRadius:3,background:"rgba(0,0,0,.08)",overflow:"hidden"}}>
+        <div style={{width:`${pct}%`,height:"100%",background:barColor,transition:"width .3s"}}/>
+      </div>
+      <span style={{fontSize:9,fontWeight:700,color:barColor,fontFamily:"monospace",minWidth:36,textAlign:"right"}}>${status.remaining_usd.toFixed(2)}</span>
+    </div>
+    {expanded&&<div style={{position:"absolute",top:"calc(100% + 6px)",right:0,zIndex:500,background:"#fff",border:"1px solid rgba(0,0,0,.1)",borderRadius:10,boxShadow:"0 8px 24px rgba(0,0,0,.12)",padding:14,width:300,fontSize:11}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+        <div><div style={{fontSize:12,fontWeight:700,color:"#111"}}>{status.name||status.code}</div><div style={{fontSize:9,color:"rgba(0,0,0,.4)",fontFamily:"monospace"}}>{status.code}</div></div>
+        <button onClick={()=>setExpanded(false)} style={{padding:"2px 6px",fontSize:14,border:"none",background:"transparent",cursor:"pointer",color:"rgba(0,0,0,.4)"}}>×</button>
+      </div>
+      <div style={{marginBottom:10}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+          <span style={{color:"rgba(0,0,0,.6)",fontSize:10}}>{lang==="zh"?"API 额度":"Budget"}</span>
+          <span style={{fontWeight:600,color:"#111",fontFamily:"monospace",fontSize:10}}>${status.spent_usd.toFixed(3)} / ${status.hard_limit_usd.toFixed(2)}</span>
+        </div>
+        <div style={{height:6,borderRadius:3,background:"rgba(0,0,0,.06)",overflow:"hidden"}}>
+          <div style={{width:`${pct}%`,height:"100%",background:barColor,transition:"width .3s"}}/>
+        </div>
+        {status.blocked&&<div style={{fontSize:9,color:"#ef4444",marginTop:4,fontWeight:600}}>{lang==="zh"?"⚠ 已达上限，请联系管理员":"⚠ Hard limit reached"}</div>}
+        {status.warning&&!status.blocked&&<div style={{fontSize:9,color:"#f59e0b",marginTop:4,fontWeight:600}}>{lang==="zh"?"⚠ 接近额度上限":"⚠ Approaching limit"}</div>}
+      </div>
+      <div style={{marginBottom:10}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+          <span style={{color:"rgba(0,0,0,.6)",fontSize:10}}>{lang==="zh"?"论文进度":"Papers"}</span>
+          <span style={{fontWeight:600,color:"#111",fontFamily:"monospace",fontSize:10}}>{status.papers_completed} / {status.papers_target}</span>
+        </div>
+        <div style={{height:6,borderRadius:3,background:"rgba(0,0,0,.06)",overflow:"hidden"}}>
+          <div style={{width:`${papersPct}%`,height:"100%",background:"linear-gradient(90deg,#8b5cf6,#06b6d4)"}}/>
+        </div>
+      </div>
+      <div style={{marginBottom:10,padding:"6px 8px",background:"rgba(0,0,0,.02)",borderRadius:5,fontSize:9,lineHeight:1.6,fontFamily:"monospace"}}>
+        <div>🔵 Claude: <b>${(status.by_provider?.anthropic||0).toFixed(3)}</b></div>
+        <div>🟢 GPT: <b>${(status.by_provider?.openai||0).toFixed(3)}</b></div>
+        <div>🟡 Gemini: <b>${(status.by_provider?.gemini||0).toFixed(3)}</b></div>
+      </div>
+      <div style={{fontSize:9,color:"rgba(0,0,0,.4)",marginBottom:10}}>
+        {lang==="zh"?"调用":"Calls"}: {status.api_calls} · {status.last_call_at?new Date(status.last_call_at).toLocaleString(lang==="zh"?"zh-CN":"en",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):"—"}
+      </div>
+      <div style={{display:"flex",gap:6}}>
+        <button onClick={()=>fetchStatus(code)} style={{flex:1,padding:"5px 8px",fontSize:10,fontWeight:600,borderRadius:5,border:"1px solid rgba(139,92,246,.2)",background:"rgba(139,92,246,.06)",color:"#8b5cf6",cursor:"pointer"}}>{lang==="zh"?"刷新":"Refresh"}</button>
+        <button onClick={logout} style={{flex:1,padding:"5px 8px",fontSize:10,fontWeight:600,borderRadius:5,border:"1px solid rgba(0,0,0,.1)",background:"rgba(0,0,0,.02)",color:"rgba(0,0,0,.6)",cursor:"pointer"}}>{lang==="zh"?"切换":"Switch"}</button>
+      </div>
+    </div>}
+  </div>;
+}
 
 function dl(content,name,type="text/plain"){
   if(!content){console.warn("dl: empty content");return;}
@@ -2109,7 +2302,7 @@ Language: ${lf}.`;
       const resps=await Promise.all(reviewTasks.map(async([rk,focus,label])=>{
         if(sig.aborted)return{rk,label,resp:"[Aborted]"};
         const reviewSys=`You are a strict academic peer reviewer focusing on ${focus}. Be thorough and specific.`;
-        const resp=await api(scorePrompt(rk,focus),reviewSys,5000,sig);
+        const resp=await api(scorePrompt(rk,focus),reviewSys,5000,sig,null,{E1:"gemini",E2:"anthropic",E3:"openai"}[rk]);
         return{rk,label,resp};
       }));
       if(sig.aborted)throw new DOMException("","AbortError");
@@ -2205,7 +2398,7 @@ Language: ${lf}.`;
             // Cache miss — call DeepSeek to extract structured summary
             const readerPrompt=`【原文·${content.length} 字】\n\n${content.substring(0,FILE_LIMITS.PER_PAPER_SENT)}\n\n请按系统提示词的规范,对该论文进行结构化精读,输出完整 JSON。`;
             try{
-              const rawRes=await api(readerPrompt, PAPER_READER_SYS, 8000, null, DEEPSEEK_MODEL);
+              const rawRes=await api(readerPrompt, PAPER_READER_SYS, 8000, null, null, "gemini", "economy");
               structured=parseJSONSafe(rawRes, null);
               if(structured){
                 await savePaperToCache(hash, structured);
@@ -2315,25 +2508,25 @@ Language: ${lf}.`;
     try{
       if(sig.aborted)throw new DOMException("","AbortError");
       add("sys",`── ${t.papersLandscape} ──`);setPaPhase(t.papersLandscape);
-      const landscape=await api(`You are reading ${valid.length} academic papers. Analyze the RESEARCH LANDSCAPE.\n\nPAPERS:\n${digest}\n\nIn ${lf}, provide:\n1. What is the common research domain/theme across these papers?\n2. What are the main methodologies used?\n3. What are the key findings and contributions of each paper?\n4. How do these papers relate to each other? What is the intellectual lineage?\n5. What is the current state of the art based on these papers?`,ROLES.E1.sys,5000,sig);
+      const landscape=await api(`You are reading ${valid.length} academic papers. Analyze the RESEARCH LANDSCAPE.\n\nPAPERS:\n${digest}\n\nIn ${lf}, provide:\n1. What is the common research domain/theme across these papers?\n2. What are the main methodologies used?\n3. What are the key findings and contributions of each paper?\n4. How do these papers relate to each other? What is the intellectual lineage?\n5. What is the current state of the art based on these papers?`,ROLES.E1.sys,5000,sig,null,"gemini");
       if(landscape.startsWith("[Error")){add("sys","✗ E1 API failed: "+landscape);throw new Error(landscape);}
       add("E1",landscape);
 
       if(sig.aborted)throw new DOMException("","AbortError");
       add("sys",`── ${t.papersGaps} ──`);setPaPhase(t.papersGaps);
-      const gaps=await api(`Based on these ${valid.length} papers:\n\n${digest}\n\nPrevious landscape analysis:\n${landscape.substring(0,1000)}\n\nIn ${lf}, find:\n1. What GAPS exist between these papers? What questions do they leave unanswered?\n2. Where do the papers CONTRADICT each other?\n3. What assumptions do they share that might be wrong?\n4. What methodological LIMITATIONS are common?\n5. What THRESHOLDS block further progress?`,ROLES.E2.sys,5000,sig);
+      const gaps=await api(`Based on these ${valid.length} papers:\n\n${digest}\n\nPrevious landscape analysis:\n${landscape.substring(0,1000)}\n\nIn ${lf}, find:\n1. What GAPS exist between these papers? What questions do they leave unanswered?\n2. Where do the papers CONTRADICT each other?\n3. What assumptions do they share that might be wrong?\n4. What methodological LIMITATIONS are common?\n5. What THRESHOLDS block further progress?`,ROLES.E2.sys,5000,sig,null,"anthropic");
       if(gaps.startsWith("[Error")){add("sys","✗ E2 API failed: "+gaps);throw new Error(gaps);}
       add("E2",gaps);
 
       if(sig.aborted)throw new DOMException("","AbortError");
       add("sys",`── ${t.papersNewQ} ──`);setPaPhase(t.papersNewQ);
-      const newQ=await api(`Based on ${valid.length} papers and analysis:\n\nLandscape: ${landscape.substring(0,800)}\nGaps: ${gaps.substring(0,800)}\n\nIn ${lf}, using SDE methodology, discover:\n1. What completely NEW QUESTIONS emerge from reading all papers together that no single paper addresses?\n2. What cross-paper ENTANGLEMENTS reveal hidden research opportunities?\n3. How could SDE (Structure-Difference-Entanglement) framework reframe these research problems?\n4. What would a breakthrough paper look like that builds on ALL of these papers?\n5. List 5-8 specific new research questions ranked by novelty and impact.`,ROLES.E3.sys,5000,sig);
+      const newQ=await api(`Based on ${valid.length} papers and analysis:\n\nLandscape: ${landscape.substring(0,800)}\nGaps: ${gaps.substring(0,800)}\n\nIn ${lf}, using SDE methodology, discover:\n1. What completely NEW QUESTIONS emerge from reading all papers together that no single paper addresses?\n2. What cross-paper ENTANGLEMENTS reveal hidden research opportunities?\n3. How could SDE (Structure-Difference-Entanglement) framework reframe these research problems?\n4. What would a breakthrough paper look like that builds on ALL of these papers?\n5. List 5-8 specific new research questions ranked by novelty and impact.`,ROLES.E3.sys,5000,sig,null,"openai");
       if(newQ.startsWith("[Error")){add("sys","✗ E3 API failed: "+newQ);throw new Error(newQ);}
       add("E3",newQ);
 
       if(sig.aborted)throw new DOMException("","AbortError");
       add("sys",`── ${t.papersNewDirs} ──`);setPaPhase("...");
-      const dirRaw=await api(`Based on analysis of ${valid.length} papers:\nLandscape:${landscape.substring(0,500)}\nGaps:${gaps.substring(0,500)}\nNew questions:${newQ.substring(0,500)}\n\nExtract at least 5 specific NEW RESEARCH QUESTIONS that emerge from reading all papers together. Each question should be a concrete, actionable research problem that no single paper addresses.\n\nALL text in ${lf}. Output ONLY JSON:\n[{"question":"The specific new research question (one sentence)","why":"Why this question matters and which gap it addresses (2-3 sentences)","from_papers":"Which input papers inspired this question"},{"question":"...","why":"...","from_papers":"..."}]`,"Output only valid JSON array.",3000,sig);
+      const dirRaw=await api(`Based on analysis of ${valid.length} papers:\nLandscape:${landscape.substring(0,500)}\nGaps:${gaps.substring(0,500)}\nNew questions:${newQ.substring(0,500)}\n\nExtract at least 5 specific NEW RESEARCH QUESTIONS that emerge from reading all papers together. Each question should be a concrete, actionable research problem that no single paper addresses.\n\nALL text in ${lf}. Output ONLY JSON:\n[{"question":"The specific new research question (one sentence)","why":"Why this question matters and which gap it addresses (2-3 sentences)","from_papers":"Which input papers inspired this question"},{"question":"...","why":"...","from_papers":"..."}]`,"Output only valid JSON array.",3000,sig,null,"anthropic","economy");
       let questions=[];
       try{let c=dirRaw.replace(/```json\s*/gi,"").replace(/```\s*/g,"").trim();const s=c.indexOf("["),e=c.lastIndexOf("]");if(s>=0&&e>s)questions=JSON.parse(c.substring(s,e+1));}catch{}
       if(questions.length<3){
@@ -2375,7 +2568,7 @@ Your task: map what already exists so we know where to look for cracks. In ${lf}
 4. **Methodological Tools**: What research methods and tools are commonly used? Are they sufficient?
 5. **Current Consensus**: Where does the field agree? What is considered settled? — These settled areas are where cracks hide beneath apparent stability.
 
-Be specific with names, dates, and publications. Flag anything that seems "too settled" — over-stability is a crack signal.`,ROLES.E1.sys,5000,sig);
+Be specific with names, dates, and publications. Flag anything that seems "too settled" — over-stability is a crack signal.`,ROLES.E1.sys,5000,sig,null,"gemini");
       add("E1",sRes);
 
       // Claw 2: Fracture Detection (抓裂缝) — E2 scans for cracks using the Four Questions
@@ -2399,7 +2592,7 @@ For each crack found, assess:
 - **Unnamed phenomena**: What exists but has no name yet?
 - **Growth potential**: Could a new concept grow here?
 
-Be ruthless. The deeper the crack, the bigger the potential weapon.`,ROLES.E2.sys,5000,sig);
+Be ruthless. The deeper the crack, the bigger the potential weapon.`,ROLES.E2.sys,5000,sig,null,"anthropic");
       add("E2",dRes);
 
       // Claw 3: Recombination Seeds (重组种子) — E3 finds cross-domain isomorphisms
@@ -2419,7 +2612,7 @@ Your task: find raw material for building NEW structures to fill the cracks. In 
 4. **Naming Opportunities**: For each recombination direction, what would the NEW concept be called? (Think about names that work in the target discipline — "rename at birth", not after)
 5. **Entanglement Assessment**: For each direction, evaluate the entanglement conditions — historical support? tool support? disciplinary readiness? problem density? Is the soil rich enough for this seed to grow?
 
-Be creative but grounded. Every proposal must connect back to a specific crack from Claw 2.`,ROLES.E3.sys,5000,sig);
+Be creative but grounded. Every proposal must connect back to a specific crack from Claw 2.`,ROLES.E3.sys,5000,sig,null,"openai");
       add("E3",eRes);
 
       // Claw 4: Forging Direction (锻造方向) — Synthesize and decide where to strike
@@ -2457,7 +2650,7 @@ In ${lf}, write a 400-500 word forging-direction synthesis:
    - Target discipline and journal
    - Preliminary renaming strategy (what would it be called?)
 
-This synthesis decides what weapon to forge next.`,SDE_SYS+`\nYou write Dragon Claw research synthesis. Language: ${lf}. Be strategic, specific, and decisive.`,5000,sig);
+This synthesis decides what weapon to forge next.`,SDE_SYS+`\nYou write Dragon Claw research synthesis. Language: ${lf}. Be strategic, specific, and decisive.`,5000,sig,null,"anthropic","premium");
 
       add("sys","✅ "+t.done);
 
@@ -2465,7 +2658,7 @@ This synthesis decides what weapon to forge next.`,SDE_SYS+`\nYou write Dragon C
       if(sig.aborted)throw new DOMException("","AbortError");
       setRPhase("New Questions...");
       const dirRaw=await api(`Based on SDE research about "${rQ}":\n${synthRes.substring(0,800)}\n\nExtract at least 3 specific NEW RESEARCH QUESTIONS that emerge from this SDE three-dimensional analysis. Each should be a concrete problem worth investigating.\n\nALL text in ${lf}. ONLY JSON:\n[{"question":"Specific new research question","why":"Why this matters and what SDE gap it addresses","sde_dim":"S/D/E - which dimension is central"}]`,
-        "Output only valid JSON array.",3000,sig);
+        "Output only valid JSON array.",3000,sig,null,"anthropic","economy");
       let newQuestions=[];
       try{let c=dirRaw.replace(/```json\s*/gi,"").replace(/```\s*/g,"").trim();
         const s=c.indexOf("["),e=c.lastIndexOf("]");
@@ -2508,7 +2701,7 @@ Be specific. Name concrete theories, papers, researchers. Every claim must conne
       setIPhase("R1·E1+E2+E3");
       const r1Results = await Promise.all(["E1","E2","E3"].map(async(role)=>{
         if(sig.aborted)return{role,txt:""};
-        const txt=await api(q1,ROLES[role].sys,8000,sig);
+        const txt=await api(q1,ROLES[role].sys,8000,sig,null,{E1:"gemini",E2:"anthropic",E3:"openai"}[role]);
         add(role,txt,1);
         return{role,txt};
       }));
@@ -2531,12 +2724,12 @@ Challenge the other models. Disagree where needed. The goal is triangular cancel
       setIPhase("R2·E1+E2+E3");
       await Promise.all(["E1","E2","E3"].map(async(role)=>{
         if(sig.aborted)return;
-        const txt=await api(q2,ROLES[role].sys,8000,sig);
+        const txt=await api(q2,ROLES[role].sys,8000,sig,null,{E1:"gemini",E2:"anthropic",E3:"openai"}[role]);
         add(role,txt,2);
       }));
       if(sig.aborted)return;add("sys",t.synthLabel,0);setIPhase("...");
       const sq=`Synthesize "${area}".\nE1:${(r1.E1||"").substring(0,300)}\nE2:${(r1.E2||"").substring(0,300)}\nE3:${(r1.E3||"").substring(0,300)}\n\nONLY JSON. ALL text in ${lf}.\n{"new_problems":["...","...","..."],"new_values":["...","..."],"new_structures":["...","..."],"directions":[{"title":"Specific paper title","innovations":["innovation point 1","innovation point 2","innovation point 3"],"abstract":"150-word paper abstract describing the core contribution and approach"},{"title":"Second paper title","innovations":["...","..."],"abstract":"150-word abstract..."},{"title":"Third paper title","innovations":["...","..."],"abstract":"150-word abstract..."}]}`;
-      const sRaw=await api(sq,"Output only valid JSON.",5000,sig);if(sig.aborted)return;
+      const sRaw=await api(sq,"Output only valid JSON.",5000,sig,null,"anthropic","economy");if(sig.aborted)return;
       try{let c=sRaw.replace(/```json\s*/gi,"").replace(/```\s*/g,"").trim();let d=0,s=-1,e=-1;for(let i=0;i<c.length;i++){if(c[i]==="{"){if(d===0)s=i;d++;}if(c[i]==="}"){d--;if(d===0){e=i;break;}}}
         if(s>=0&&e>s)setSynth(JSON.parse(c.substring(s,e+1)));else throw 0;}catch{setSynth({new_problems:sRaw.split("\n").filter(l=>l.trim().length>10).slice(0,3),new_values:[],new_structures:[],directions:[{title:area,innovations:["Dragon Claw analysis"],abstract:"Based on GCG three-model collaborative forging."}]});}
       add("sys",t.done,0);
@@ -2577,10 +2770,10 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
         pd.secs.push({num,title:s,content:c});pl("  ✓ ~"+c.split(/\s+/).length+"w","#10b981");
         ent+="\n["+s+"]:"+c.split("\n\n").slice(0,2).join(" ").substring(0,250);if(ent.length>2500){const ls=ent.split("\n");ent=ls.slice(0,1).concat(ls.slice(-4)).join("\n");}n++;setPProg(n/tot);}
       if(sig.aborted)throw new DOMException("","AbortError");pl("["+(secs.length+2)+"] Refs...","#f59e0b");
-      const rr=await api(`15-20 refs for "${pd.title}" in ${domObj.label}. [N] Author,"Title," Journal,Year.`,SYS,3000,sig);
+      const rr=await api(`15-20 refs for "${pd.title}" in ${domObj.label}. [N] Author,"Title," Journal,Year.`,SYS,3000,sig,null,"gemini","economy");
       pd.refs=rr.split("\n").filter(l=>l.trim().match(/^\[?\d/));pl("  ✓ "+pd.refs.length+" refs","#10b981");n++;setPProg(n/tot);
       if(sig.aborted)throw new DOMException("","AbortError");pl("["+tot+"] Title...","#f59e0b");
-      const tr=await api(`Based on ACTUAL content:\nAbstract:${pd.abs}\nSections:${pd.secs.map(s=>s.title+":"+s.content.substring(0,100)).join("\n")}\nGenerate best title. ${lf}. ONLY the title.`,"Output only a title.",500,sig);
+      const tr=await api(`Based on ACTUAL content:\nAbstract:${pd.abs}\nSections:${pd.secs.map(s=>s.title+":"+s.content.substring(0,100)).join("\n")}\nGenerate best title. ${lf}. ONLY the title.`,"Output only a title.",500,sig,null,"anthropic","economy");
       const nt=tr.trim().replace(/^["']|["']$/g,"").replace(/^Title:\s*/i,"");if(nt.length>10&&nt.length<200&&!nt.includes("[Error")){pl("  ✓ →"+nt,"#10b981");pd.title=nt;}
       setPProg(1);pl("✅ ~"+pd.secs.reduce((s,x)=>s+x.content.split(/\s+/).length,0)+"w","#10b981");
       setPaper(dedupPaper(pd));setCleanLog(null);setTimeout(()=>setPStep("read"),500);
@@ -2621,7 +2814,7 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
           `2. For each issue, state which section it's in and what exactly to fix\n`+
           `3. Rate each section (1-10)\n`+
           `4. Overall assessment and priority improvements`,
-          ROLES[rk].sys,5000,sig);
+          ROLES[rk].sys,5000,sig,null,{E1:"gemini",E2:"anthropic",E3:"openai"}[rk]);
         return{rk,resp};
       }));
       if(sig.aborted)throw new DOMException("","AbortError");
@@ -2642,7 +2835,7 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
           (secFbs[sec.num]?`SECTION-SPECIFIC FEEDBACK:\n${secFbs[sec.num]}\n\n`:"\n")+
           (revText?`REVIEWER COMMENTS:\n${revText}\n\n`:"")+
           `INSTRUCTIONS: Revise COMPLETELY. Do NOT shorten. Do NOT prepend abstract. Output ONLY revised text. ${lf}.`,
-          PAPER_SYS,6000,sig);
+          PAPER_SYS,6000,sig,null,"anthropic","premium");
         const ncClean=nc.replace(/^#+\s*Abstract[\s\S]*?\n\n/i,"").replace(/^Abstract[:\s]*\n/i,"").trim();
         rv.secs.push({num:sec.num,title:sec.title,content:ncClean});
         pl(`  ✓ ${sec.title} (${sec.content.split(/\s+/).length}w → ${ncClean.split(/\s+/).length}w)`,"#10b981");
@@ -2658,7 +2851,7 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
 
       // Refine title
       if(sig.aborted)throw new DOMException("","AbortError");
-      const nt=await api(`Revised paper:\nAbstract:${rv.abs||""}\nSections:${rv.secs.map(s=>s.title+":"+s.content.substring(0,200)).join("\n")}\nONLY title. ${lf}.`,"Output title only.",500,sig);
+      const nt=await api(`Revised paper:\nAbstract:${rv.abs||""}\nSections:${rv.secs.map(s=>s.title+":"+s.content.substring(0,200)).join("\n")}\nONLY title. ${lf}.`,"Output title only.",500,sig,null,"anthropic","economy");
       const ct=nt.trim().replace(/^["']|["']$/g,"").replace(/^Title:\s*/i,"");
       if(ct.length>10&&ct.length<200&&!ct.includes("[Error"))rv.title=ct;
 
@@ -2779,7 +2972,7 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
       pl(`  [0.1] ${isZh?"学科定位诊断":"Discipline diagnosis"}...`,"#06b6d4");trackCall();
       const diagRes=await api(
         `研究主题:"${topic}"\n学科领域:${domInfo.label}\n\n请诊断并输出 JSON。`,
-        DIAGNOSIS_SYS, 2000, sig, DEEPSEEK_REASONER
+        DIAGNOSIS_SYS, 2000, sig
       );
       const diag=parseJSONSafe(diagRes, {
         primary_discipline: domInfo.label,
@@ -2805,7 +2998,8 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
       const anglesPrompt=isZh
         ?`研究综述:\n${research.substring(0,2000)}\n\n请生成 3-5 个候选研究角度。每个角度要适合国内核心期刊(倾向"增量创新"而非"颠覆性创新")。\n\n严格输出 JSON 数组:\n[{"angle":"角度描述","innovation_type":"理论创新|方法创新|应用创新|综合创新","difficulty":"low|medium|high","publish_potential":"medium|high","risk":"主要风险"},...]`
         :`Based on research:\n${research.substring(0,2000)}\nGenerate 3-5 candidate angles as JSON array.`;
-      const anglesRes=await api(anglesPrompt, SYS, 3000, sig, DEEPSEEK_REASONER);
+      // W4 Angles — core workstation, premium tier (decides WHERE to strike)
+      const anglesRes=await api(anglesPrompt, SYS, 3000, sig, null, "anthropic", "premium");
       const angles=parseJSONSafe(anglesRes, [{angle: topic, innovation_type: "综合创新"}]);
       pl(`  ✓ ${Array.isArray(angles)?angles.length:0} ${isZh?"个候选角度":"candidates"}`,"#10b981");
 
@@ -2815,7 +3009,8 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
       const convergePrompt=isZh
         ?`候选角度:\n${JSON.stringify(angles, null, 2)}\n\n请选出最适合国内核心期刊发表的一个。\n严格输出 JSON:\n{"selected_angle":"最终选定的研究角度","title":"30 字以内的论文标题","core_thesis":"30 字以内核心论断","abstract_draft":"150 字摘要草稿","why_this":"为何选择此角度(50 字)"}`
         :`From candidates:\n${JSON.stringify(angles)}\nOutput JSON: {"selected_angle":"...","title":"...","core_thesis":"...","abstract_draft":"...","why_this":"..."}`;
-      const convergeRes=await api(convergePrompt, SYS, 2000, sig, DEEPSEEK_REASONER);
+      // W4 Converge — core workstation, premium tier (final direction decision)
+      const convergeRes=await api(convergePrompt, SYS, 2000, sig, null, "anthropic", "premium");
       const direction=parseJSONSafe(convergeRes, {
         selected_angle: topic,
         title: topic,
@@ -2836,7 +3031,8 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
       const outlinePrompt=isZh
         ?`研究主题:${topic}\n选定方向:${direction.selected_angle}\n核心论点:${direction.core_thesis}\n学科:${diag.primary_discipline} (${diag.sub_discipline})\n目标期刊:${(diag.typical_journals||[]).join(", ")}\n\n研究综述:\n${research.substring(0,1500)}\n\n请为这篇论文生成完整的提纲锁定 JSON。务必:\n- 所有文献要真实存在(confidence 字段诚实填写)\n- 至少 8 条中文文献\n- 章节计划含每章 claim 和 must_cite\n- 全文 8000-15000 字,分到 7 章平均每章 1200-2000 字`
         :`Topic: ${topic}\nAngle: ${direction.selected_angle}\nThesis: ${direction.core_thesis}\nResearch summary: ${research.substring(0,1500)}\nGenerate full outline-lock JSON.`;
-      const outlineRes=await api(outlinePrompt, OUTLINE_SYS, 8000, sig, DEEPSEEK_REASONER);
+      // W5 Outline lock — core workstation, premium tier (paper skeleton, cannot be fixed later)
+      const outlineRes=await api(outlinePrompt, OUTLINE_SYS, 8000, sig, null, "anthropic", "premium");
       const outline=parseJSONSafe(outlineRes, {
         core_thesis: direction.core_thesis,
         key_terms: [],
@@ -2852,7 +3048,7 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
       const verifyPrompt=isZh
         ?`核验以下文献:\n${JSON.stringify(outline.key_authors||[], null, 2)}`
         :`Verify these citations:\n${JSON.stringify(outline.key_authors||[])}`;
-      const verifyRes=await api(verifyPrompt, CITE_VERIFY_SYS, 4000, sig);
+      const verifyRes=await api(verifyPrompt, CITE_VERIFY_SYS, 4000, sig, null, "gemini", "economy");
       const verifyResult=parseJSONSafe(verifyRes, {verified: outline.key_authors||[], removed: []});
       outline.key_authors=verifyResult.verified||outline.key_authors||[];
       pl(`  ✓ ${outline.key_authors.length} ${isZh?"条文献验证通过":"verified"} (${isZh?"删除":"removed"} ${(verifyResult.removed||[]).length})`,"#10b981");
@@ -2902,7 +3098,8 @@ Output EXACTLY these 3 items. Do NOT write any section content. Do NOT write Int
         const skelPrompt=isZh
           ?`章节:第 ${num} 章 "${sTitle}"\n本章 claim:${ch.claim||sTitle}\n必引:${(ch.must_cite||[]).join(", ")}\n目标字数:${ch.word_target||1500} 字\n${prevEnd?`前章结尾:${prevEnd}\n`:""}${transBridge?`需要承接:${transBridge}\n`:""}\n\n请生成章节骨架 JSON。`
           :`Chapter ${num}: "${sTitle}"\nClaim: ${ch.claim}\nMust cite: ${(ch.must_cite||[]).join(", ")}\nGenerate skeleton JSON.`;
-        const skelRes=await api(skelPrompt, CHAPTER_SKELETON_SYS, 2000, sig);
+        // W5 Chapter skeleton — premium tier (per-chapter structural design)
+        const skelRes=await api(skelPrompt, CHAPTER_SKELETON_SYS, 2000, sig, null, "anthropic", "premium");
         const skel=parseJSONSafe(skelRes, {paragraphs: []});
 
         // 章节正文(Step 2.b)
@@ -2939,7 +3136,8 @@ ${nextClaim?`【下一章主题(末尾需铺垫)】${nextClaim}\n`:""}
 
 直接输出正文,不要任何元说明。`
           :`Write Chapter ${num} "${sTitle}" of paper "${direction.title}".\nClaim: ${ch.claim}\nUse unified terms and only cite from the given list.\nLength: ~${ch.word_target||1500} words.\nLanguage: ${lf}.`;
-        let c=await api(writePrompt, SYS, 4000, sig);
+        // W5 Writing — premium tier (the actual paper content, quality-decisive)
+        let c=await api(writePrompt, SYS, 4000, sig, null, "anthropic", "premium");
         c=c.replace(/^#+\s*(Abstract|摘要)[\s\S]*?\n\n/i,"").replace(/^(Abstract|摘要)[:\s]*\n/i,"").trim();
         pd.secs.push({num,title:sTitle,content:c,claim:ch.claim||""});
       }
@@ -2956,7 +3154,8 @@ ${nextClaim?`【下一章主题(末尾需铺垫)】${nextClaim}\n`:""}
       const abstractPrompt=isZh
         ?`根据以下论文内容,生成规范的中文学术摘要。\n\n标题:${direction.title}\n核心论点:${outline.core_thesis||direction.core_thesis}\n\n章节大意:\n${pd.secs.map(s=>`${s.num}. ${s.title}: ${(s.content||"").substring(0,200)}`).join("\n")}\n\n请输出:\nTITLE: <精炼标题>\nABSTRACT: <200-300 字摘要,包含目的/方法/结论/意义>\nKEYWORDS: <4-6 个关键词, 逗号分隔>\n\n严格按此格式,不含其他内容。`
         :`Generate abstract based on paper content.\nTITLE: ...\nABSTRACT: 200-300 words\nKEYWORDS: ...`;
-      const abRes=await api(abstractPrompt, SYS, 1500, sig);
+      // W5 Abstract/title/keywords — balanced tier (moderately sensitive)
+      const abRes=await api(abstractPrompt, SYS, 1500, sig, null, "anthropic", "balanced");
       const tm=abRes.match(/TITLE[::]?\s*(.+?)(?:\n|ABSTRACT)/s);
       const am=abRes.match(/ABSTRACT[::]?\s*([\s\S]+?)(?:KEYWORDS|$)/i);
       const km=abRes.match(/KEYWORDS[::]?\s*(.+)/i);
@@ -2971,7 +3170,7 @@ ${nextClaim?`【下一章主题(末尾需铺垫)】${nextClaim}\n`:""}
       const refsPrompt=isZh
         ?`请把以下文献列表转化为严格的 GB/T 7714 格式。\n\n文献源:\n${citesTable}\n\n输出规范:\n- 期刊:[N] 作者. 标题[J]. 期刊名, 年份, 卷(期): 起止页码.\n- 专著:[N] 作者. 书名[M]. 出版地: 出版社, 年份: 页码.\n- 英文文献保留原文\n- 每行一条,从 [1] 开始编号\n\n只输出规范化后的参考文献列表,不含其他内容。`
         :`Format as GB/T 7714 references. Source:\n${citesTable}\nOutput one per line starting [1].`;
-      const refsRes=await api(refsPrompt, SYS, 3000, sig);
+      const refsRes=await api(refsPrompt, SYS, 3000, sig, null, "gemini", "economy");
       pd.refs=refsRes.split("\n").filter(l=>l.trim().match(/^\[?\d/)).map(l=>l.trim());
       pl(`  ✓ ${pd.refs.length} ${isZh?"条参考文献":"references"}`,"#10b981");
 
@@ -2985,7 +3184,8 @@ ${nextClaim?`【下一章主题(末尾需铺垫)】${nextClaim}\n`:""}
       const auditPrompt=isZh
         ?`【提纲】\n核心论点:${outline.core_thesis||""}\n关键术语:${(outline.key_terms||[]).map(t=>t.zh||t.term).join(", ")}\n\n【论文正文】\n${pd.secs.map(s=>`## ${s.num}. ${s.title}\n${(s.content||"").substring(0,1500)}`).join("\n\n")}\n\n请严格审计这篇论文的一致性,输出 JSON。`
         :`Audit paper consistency against outline.\nOutline: ${outline.core_thesis}\n${pd.secs.map(s=>`## ${s.title}\n${(s.content||"").substring(0,1500)}`).join("\n\n")}`;
-      const auditRes=await api(auditPrompt, AUDITOR_SYS, 6000, sig, DEEPSEEK_REASONER);
+      // W6 Consistency audit — balanced tier (catches drift across the paper)
+      const auditRes=await api(auditPrompt, AUDITOR_SYS, 6000, sig, null, "anthropic", "balanced");
       const audit=parseJSONSafe(auditRes, {overall_score: 70, action_list: []});
       const actionList=audit.action_list||[];
       pl(`  ✓ ${isZh?"审计分":"Score"}: ${audit.overall_score||70} · ${actionList.length} ${isZh?"项修改建议":"actions"}`,audit.overall_score>=75?"#10b981":"#f59e0b");
@@ -3036,19 +3236,22 @@ ${nextClaim?`【下一章主题(末尾需铺垫)】${nextClaim}\n`:""}
       const fullRevText=`TITLE: ${polRv.title}\nABSTRACT: ${polRv.abs||""}\n\n${revText}`;
       const qScorePromptCN=(focusSys, focusName)=>`【审稿任务】\n\n论文:\n${fullRevText}\n\n请按"${focusName}"维度审稿,严格评分。`;
       const qRevTasks=isZh?[
-        ["E1", REVIEW_E1_CN, "事实与材料"],
-        ["E2", REVIEW_E2_CN, "逻辑与论证"],
-        ["E3", REVIEW_E3_CN, "创新与价值"],
+        ["E1", REVIEW_E1_CN, "事实与材料", "gemini"],
+        ["E2", REVIEW_E2_CN, "逻辑与论证", "anthropic"],
+        ["E3", REVIEW_E3_CN, "创新与价值", "openai"],
       ]:[
-        ["E1", ROLES.E1.sys, "FACTUAL ACCURACY"],
-        ["E2", ROLES.E2.sys, "LOGICAL RIGOR"],
-        ["E3", ROLES.E3.sys, "INNOVATION"],
+        ["E1", ROLES.E1.sys, "FACTUAL ACCURACY", "gemini"],
+        ["E2", ROLES.E2.sys, "LOGICAL RIGOR", "anthropic"],
+        ["E3", ROLES.E3.sys, "INNOVATION", "openai"],
       ];
-      pl(`  [4.1-4.3] ${isZh?"E1 + E2 + E3 并行审稿 (R1)":"E1+E2+E3 parallel (R1)"}...`,"#f97316");
-      const qRevResps=await Promise.all(qRevTasks.map(async([rk,sysPrompt,focusName])=>{
+      pl(`  [4.1-4.3] ${isZh?"E1 + E2 + E3 并行审稿 (GCG 真·三角互消)":"E1+E2+E3 parallel (true GCG triangulation)"}...`,"#f97316");
+      const qRevResps=await Promise.all(qRevTasks.map(async([rk,sysPrompt,focusName,provider])=>{
         if(sig.aborted)return{rk,resp:""};
         trackCall();
-        const resp=await api(qScorePromptCN(sysPrompt, focusName), sysPrompt, 4000, sig, DEEPSEEK_REASONER);
+        // Each role natively staffed: E1=Gemini (reality), E2=Claude (reasoning), E3=GPT (entanglement)
+        // When provider is "deepseek" or undefined, fall back to R1 model for deep reasoning
+        const model = null; // Global edition: all providers use their native default model
+        const resp=await api(qScorePromptCN(sysPrompt, focusName), sysPrompt, 4000, sig, model, provider);
         return{rk,resp};
       }));
       if(sig.aborted)throw new DOMException("","AbortError");
@@ -3071,6 +3274,8 @@ ${nextClaim?`【下一章主题(末尾需铺垫)】${nextClaim}\n`:""}
       setQStep(6);
       pl(`${t.quickDone} · ${isZh?"调用":"calls"} ${callCount} · ${isZh?"耗时":"time"} ${Math.floor(totalTime/60)}m${totalTime%60}s`,"#10b981");
       pl("── 📥 "+(isZh?"论文输出":"Paper Output")+" ──","#3b82f6");
+      // Mark this paper as completed in student tracker (if logged in)
+      markPaperDone().then(d=>{if(d)pl(`${isZh?"论文进度":"Papers"}: ${d.papers_completed}/${d.papers_target} (${d.progress_pct}%)`,"#8b5cf6");});
       setTimeout(()=>setQStep(7),500);
       // Reset to 0 after output step is visible for 2 seconds
       setTimeout(()=>setQStep(0),2500);
@@ -3498,7 +3703,7 @@ ${nextClaim?`【下一章主题(末尾需铺垫)】${nextClaim}\n`:""}
             <div style={{fontSize:5,color:"rgba(255,255,255,.8)",fontFamily:"monospace",marginTop:1}}>FORGE</div>
           </div>
         </div>
-        <div style={{fontSize:36,fontWeight:900,background:"linear-gradient(135deg,#f59e0b 0%,#ef4444 30%,#8b5cf6 60%,#06b6d4 100%)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",marginBottom:6,letterSpacing:2,animation:"titleFire 4s ease-in-out infinite"}}>SDE-Claw</div>
+        <div style={{fontSize:36,fontWeight:900,background:"linear-gradient(135deg,#f59e0b 0%,#ef4444 30%,#8b5cf6 60%,#06b6d4 100%)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",marginBottom:6,letterSpacing:2,animation:"titleFire 4s ease-in-out infinite"}}>SDEClaw-GCG</div>
         <div style={{fontSize:15,color:"rgba(255,255,255,.95)",fontWeight:500,marginBottom:6}}>{lang==="zh"?"龙爪手 · 科研自动化系统":"Dragon Claw · Research Automation"}</div>
         <div style={{fontSize:10,color:"rgba(255,255,255,.55)",fontFamily:"monospace",marginBottom:44,letterSpacing:2}}>{lang==="zh"?"裂缝第一 · 六爪锻造 · 武器改姓 · 学科投放":"Crack-First · Six-Claw · Weapon Rename · Deploy"}</div>
         <div style={{display:"flex",gap:16,maxWidth:700,width:"100%",flexWrap:"wrap",justifyContent:"center"}}>
@@ -3520,7 +3725,10 @@ ${nextClaim?`【下一章主题(末尾需铺垫)】${nextClaim}\n`:""}
           </div>
         </div>
         <div style={{marginTop:36,fontSize:12,color:"rgba(255,255,255,.55)",fontStyle:"italic",textAlign:"center",maxWidth:520}}>{lang==="zh"?"\"知识创新始于对裂缝的高敏感抓取。龙爪手不是说新，而是打新。\"":"\"Innovation starts from seizing cracks. Dragon Claw forges new.\""}</div>
-        <div style={{marginTop:24,fontSize:9,color:"rgba(255,255,255,.4)",fontFamily:"monospace"}}>SDE-Claw v0.6 · Demai International Pte. Ltd.</div>
+        <div style={{marginTop:24,fontSize:9,color:"rgba(255,255,255,.4)",fontFamily:"monospace",textAlign:"center"}}>
+          SDEClaw-GCG v0.7 · Gemini · Claude · GPT<br/>
+          <span style={{color:"rgba(255,255,255,.3)"}}>Internal Team Testing · Full Premium Tier · Demai International Pte. Ltd.</span>
+        </div>
       </div>
       {gateTarget&&<div style={{position:"absolute",inset:0,background:"rgba(0,0,0,.4)",backdropFilter:"blur(8px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:20}}>
         <div style={{background:"#fff",borderRadius:16,padding:"28px 24px",maxWidth:420,width:"100%",boxShadow:"0 20px 60px rgba(0,0,0,.2)"}}>
@@ -3538,10 +3746,11 @@ ${nextClaim?`【下一章主题(末尾需铺垫)】${nextClaim}\n`:""}
         <button onClick={goHome} style={{padding:"2px 6px",fontSize:14,borderRadius:5,border:"1px solid rgba(139,92,246,.2)",background:"rgba(139,92,246,.06)",color:"#8b5cf6",cursor:"pointer",lineHeight:1,fontWeight:600}} title={lang==="zh"?"保存并返回首页":"Save & Home"}>←</button>
         <div style={{display:"flex",alignItems:"center",gap:5,cursor:"pointer"}} onClick={goHome}>
           <div style={{width:22,height:22,borderRadius:4,background:"linear-gradient(135deg,#8b5cf6,#06b6d4)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:8,fontWeight:800,color:"#fff",fontFamily:"monospace",transition:"transform .15s"}} onMouseEnter={e=>e.currentTarget.style.transform="scale(1.12)"} onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>SC</div>
-          <span style={{fontSize:12,fontWeight:700,background:"linear-gradient(135deg,#8b5cf6,#06b6d4)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>SDE-Claw</span>
+          <span style={{fontSize:12,fontWeight:700,background:"linear-gradient(135deg,#8b5cf6,#06b6d4)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>SDEClaw-GCG</span>
         </div>
       </div>
-      <div style={{display:"flex",gap:2,alignItems:"center"}}>
+      <div style={{display:"flex",gap:6,alignItems:"center"}}>
+        <StudentBadge lang={lang}/>
         <button onClick={()=>setLang(lang==="zh"?"en":"zh")} style={{padding:"3px 7px",fontSize:9,fontWeight:600,borderRadius:4,background:"rgba(0,0,0,.12)",color:"rgba(0,0,0,.8)",border:"1px solid rgba(0,0,0,.1)",fontFamily:"monospace",marginRight:3}}>{lang==="zh"?"中/EN":"EN/中"}</button>
         {entryMode&&<span style={{fontSize:8,padding:"2px 6px",borderRadius:3,background:entryMode==="quick"?"rgba(245,158,11,.12)":"rgba(139,92,246,.12)",color:entryMode==="quick"?"#f59e0b":"#8b5cf6",fontFamily:"monospace",fontWeight:600,marginRight:2}}>{entryMode==="quick"?(lang==="zh"?"⚡直接":"⚡Quick"):(lang==="zh"?"🐉协作":"🐉Collab")}</span>}
         {[["quick",t.quick,"#ffffff"],["papers",t.papers,"#ec4899"],["research",t.research,"#ef4444"],["inspire",t.inspire,"#f59e0b"],["paper",t.paper,"#8b5cf6"],["polish",t.polish,"#10b981"],["review",t.review,"#f97316"]].filter(([k])=>entryMode==="quick"?k==="quick":entryMode==="collab"?k!=="quick":true).map(([k,l,c])=>
