@@ -175,15 +175,15 @@ async function readFileAsText(file){
 // We reserve ~50% for prompts/output, so usable content budget ≈ 50K chars
 // ═══════════════════════════════════════════════════════════════════
 const FILE_LIMITS = {
-  SAFE_CHARS: 20000,      // 🟢 单篇字数安全上限(已扩至 2 万字)
-  WARN_CHARS: 40000,      // 🟡 超过 4 万字才警告(大论文)
-  SAFE_SIZE_MB: 10,       // 🟢 文件大小安全
-  WARN_SIZE_MB: 15,       // 🟡 警告
-  HARD_SIZE_MB: 30,       // 🔴 硬上限(拒绝)
-  SAFE_PAGES: 50,         // 🟢 PDF 页数安全
-  WARN_PAGES: 100,        // 🟡 警告
-  PER_PAPER_SENT: 20000,  // 每篇发给 DeepSeek 做结构化阅读的字符上限
-  TOTAL_BUDGET: 400000,   // 总上限:20 篇 × 2 万字
+  SAFE_CHARS: 200000,     // 🟢 单篇字数安全上限(放开至 20 万字,支持整本书章节级长文)
+  WARN_CHARS: 400000,     // 🟡 超过 40 万字才警告
+  SAFE_SIZE_MB: 25,       // 🟢 文件大小安全(放宽到 25MB)
+  WARN_SIZE_MB: 40,       // 🟡 警告
+  HARD_SIZE_MB: 80,       // 🔴 硬上限(拒绝) — 80MB 能吞几乎任何合理 PDF
+  SAFE_PAGES: 400,        // 🟢 PDF 页数安全(放宽到 400 页,整本专著)
+  WARN_PAGES: 800,        // 🟡 警告
+  PER_PAPER_SENT: 200000, // 每篇发给 AI 精读的字符上限 — 20 万字充分利用 Gemini 2M 窗口
+  TOTAL_BUDGET: 4000000,  // 总上限:20 篇 × 20 万字 = 400 万字(Gemini Pro 2M tokens 的 80% 利用率)
 };
 
 function getFileLevel(meta) {
