@@ -2498,7 +2498,7 @@ Language: ${lf}.`;
     const needsReading=validCopy.filter(p=>!p.structured);
     if(needsReading.length>0){
       const t0=Date.now();
-      add("sys",`⏳ ${lang==="zh"?"W1 精读阶段 · Gemini 2.5 Pro":"W1 Reading Stage · Gemini 2.5 Pro"} — ${needsReading.length} ${lang==="zh"?"篇（并发 5，自动重试）":"papers (concurrency 5, auto-retry)"}`);
+      add("sys",`⏳ ${lang==="zh"?"W1 精读阶段 · Gemini 2.5 Flash":"W1 Reading Stage · Gemini 2.5 Flash"} — ${needsReading.length} ${lang==="zh"?"篇（并发 5，自动重试）":"papers (concurrency 5, auto-retry)"}`);
       setPaPhase(lang==="zh"?`精读 ${needsReading.length} 篇论文中`:`Reading ${needsReading.length} papers`);
 
       const readTasks=needsReading.map((paper,idx)=>async()=>{
