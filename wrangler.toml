@@ -1,15 +1,38 @@
+# SDEClaw-GCG Cloudflare Worker Configuration
+# =====================================================================
+# Single-user beta mode — no KV namespace, no student tracking required.
+# Worker auto-detects missing KV and skips all student validation logic.
+#
+# When ready to upgrade to 3-person team mode:
+#   1. Create KV namespace via Dashboard (Storage & Databases → KV → "STUDENTS")
+#   2. Uncomment the [[kv_namespaces]] block below and paste the ID
+#   3. Set ADMIN_TOKEN secret
+#   4. Redeploy
+
 name = "sde-claw"
-main = "worker/index.js"
-compatibility_date = "2026-04-16"
-compatibility_flags = ["nodejs_compat"]
+main = "index.js"
+compatibility_date = "2024-10-01"
 
-[assets]
-directory = "./dist"
-binding = "ASSETS"
-not_found_handling = "single-page-application"
-# Worker handles /api/* first; all other paths serve static files directly
-run_worker_first = ["/api/*"]
+# Static SPA assets (React build output)
+[site]
+bucket = "./dist"
 
-# Observability: log Worker requests for debugging
+# ─────────────────────────────────────────────────────────────────────
+# Student tracking (DISABLED for single-user beta)
+# To enable later, uncomment these lines and paste the KV namespace ID:
+# ─────────────────────────────────────────────────────────────────────
+# [[kv_namespaces]]
+# binding = "STUDENTS"
+# id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+
+# ─────────────────────────────────────────────────────────────────────
+# Secrets — set via Dashboard → Worker → Settings → Variables → Secrets:
+#   ANTHROPIC_API_KEY   (required, Claude / E2)
+#   OPENAI_API_KEY      (required, GPT / E3)
+#   GEMINI_API_KEY      (required, Gemini / E1)
+#   DEEPSEEK_API_KEY    (optional, legacy endpoint only)
+#   ADMIN_TOKEN         (not needed for single-user beta)
+# ─────────────────────────────────────────────────────────────────────
+
 [observability]
 enabled = true
