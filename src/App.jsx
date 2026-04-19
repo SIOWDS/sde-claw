@@ -2512,7 +2512,9 @@ Language: ${lf}.`;
 
         if(!structured){
           const readerPrompt=`【原文·${paper.content.length} 字】\n\n${paper.content.substring(0,FILE_LIMITS.PER_PAPER_SENT)}\n\n请按系统提示词的规范,对该论文进行结构化精读,输出完整 JSON。`;
-          const rawRes=await api(readerPrompt, PAPER_READER_SYS, 8000, sig, null, "gemini", "premium");
+          // W1 精读 · E1 事实捕获 — 降回 Flash（Pro 2 万字精读会超时,Flash 5-10 秒稳定返回）
+          // 精读本质是结构化信息提取,Flash 的性价比和稳定性都更优
+          const rawRes=await api(readerPrompt, PAPER_READER_SYS, 8000, sig, null, "gemini", "economy");
           if(rawRes.startsWith("[Error")){throw new Error(rawRes);}
           structured=parseJSONSafe(rawRes, null);
           if(structured){await savePaperToCache(hash, structured);}
