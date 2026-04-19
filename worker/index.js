@@ -2,7 +2,7 @@
 // ================================================================================
 // Product: SDEClaw-GCG v0.7 (面向全球开放 · Global Premium Edition)
 // Engine : Gemini (E1) + Claude (E2) + GPT (E3) — true GCG triangulation
-// Tier   : Internal Team Testing · FULL PREMIUM (Opus 4.7 + GPT-4.1 + Gemini 2.5 Pro)
+// Tier   : Internal Team Testing · FULL PREMIUM (Sonnet 4.6 + GPT-4.1 + Gemini 2.5 Pro)
 //          ~ $6-8/paper at top quality, designed for 3-dev × 10-paper internal validation
 //          Prompt Caching: Anthropic (explicit), OpenAI & Gemini (automatic) — 15-25% savings
 //          Per-person hard limit: $20 (¥140)
@@ -35,23 +35,23 @@ const DEFAULT_MODELS = {
   // ─────────────────────────────────────────────────────────────
   // Internal Team Testing · FULL PREMIUM (current)
   //   All three providers at flagship — no compromise on quality
-  //     Claude  : Opus 4.7   (flagship)
-  //     OpenAI  : GPT-4.1    (flagship)
-  //     Gemini  : 2.5 Pro    (flagship)
-  //   Rationale: 3-person internal team + ¥3000 budget → product quality ceiling validation
-  //              Identifies whether top-model output is publishable; downgrade decisions later
+  //     Claude  : Sonnet 4.6 (stable, 4.7 has API breaking changes - upgrade later)
+  //     OpenAI  : GPT-4.1   (flagship)
+  //     Gemini  : 2.5 Pro   (flagship)
+  //   Rationale: Sonnet 4.6 has excellent reasoning while avoiding 4.7 API compatibility issues
+  //              Will upgrade to Opus 4.7 once its API (temperature deprecation, etc) settles
   //   Per-person budget: $20 (¥140) hard limit, $15 (¥105) soft warning
   //
   //   TIER_MODELS below still works for future per-workstation downgrades post-internal-testing
   // ─────────────────────────────────────────────────────────────
-  anthropic: "claude-opus-4-7",    // E2 Reasoning — flagship
-  openai:    "gpt-4.1",             // E3 Entanglement — flagship
-  gemini:    "gemini-2.5-pro",      // E1 Reality — flagship
-  deepseek:  "deepseek-chat",       // legacy, not invoked by frontend
+  anthropic: "claude-sonnet-4-6",   // E2 Reasoning — Sonnet 4.6 stable (upgrade to Opus 4.7 later)
+  openai:    "gpt-4.1",              // E3 Entanglement — flagship
+  gemini:    "gemini-2.5-pro",       // E1 Reality — flagship
+  deepseek:  "deepseek-chat",        // legacy, not invoked by frontend
 };
 
 const TIER_MODELS = {
-  premium:  { anthropic: "claude-opus-4-7",   openai: "gpt-4.1",       gemini: "gemini-2.5-pro"   },
+  premium:  { anthropic: "claude-sonnet-4-6", openai: "gpt-4.1",       gemini: "gemini-2.5-pro"   },
   balanced: { anthropic: "claude-sonnet-4-6", openai: "gpt-4.1",       gemini: "gemini-2.5-pro"   },
   economy:  { anthropic: "claude-sonnet-4-6", openai: "gpt-4.1-mini",  gemini: "gemini-2.5-flash" },
 };
@@ -307,6 +307,15 @@ async function callAnthropicRaw(env, model, messages, max_tokens, temperature) {
     ? [{ type: "text", text: systemCombined, cache_control: { type: "ephemeral" } }]
     : undefined;
 
+  // Build request body — temperature is deprecated for Opus 4.7 and newer models
+  // so we omit it entirely; Claude's default sampling works well for our use cases
+  const reqBody = {
+    model,
+    system: systemBlock,
+    messages: convoMsgs,
+    max_tokens: max_tokens || 4000,
+  };
+
   const upstream = await fetch(ANTHROPIC_URL, {
     method: "POST",
     headers: {
@@ -315,13 +324,7 @@ async function callAnthropicRaw(env, model, messages, max_tokens, temperature) {
       "anthropic-beta": "prompt-caching-2024-07-31",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model,
-      system: systemBlock,
-      messages: convoMsgs,
-      max_tokens: max_tokens || 4000,
-      temperature: typeof temperature === "number" ? temperature : 0.7,
-    }),
+    body: JSON.stringify(reqBody),
   });
   if (!upstream.ok) {
     const t = await upstream.text().catch(() => "");
@@ -553,7 +556,7 @@ async function handleHealth(env) {
     ok: true,
     product: "SDEClaw-GCG",
     version: "v0.7",
-    edition: "Internal Team Testing · FULL PREMIUM (Opus 4.7 + GPT-4.1 + Gemini 2.5 Pro)",
+    edition: "Internal Team Testing · FULL PREMIUM (Sonnet 4.6 + GPT-4.1 + Gemini 2.5 Pro)",
     tier: "full_premium",
     endpoints: {
       "/api/ai":                  "GCG multi-provider with student tracking",
