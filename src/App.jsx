@@ -2362,71 +2362,53 @@ Language: ${lf}.`;
       setInputPapers(p=>[...p,{id:"warn_"+Date.now(),name:"⚠️ Upload Limit",content:warnMsg,meta:{level:"warn",chars:0,sizeMB:0}}].slice(0,MAX_PAPERS));
     }
 
-    for(const file of willProcess){
-      const jobId=(crypto.randomUUID?crypto.randomUUID():("id_"+Date.now()+"_"+Math.random().toString(36).slice(2)));
-      const name=file.name;
-      const sizeMB=+(file.size/1024/1024).toFixed(2);
+    // Pre-generate job IDs so we can show all placeholders instantly
+    const jobs=willProcess.map(file=>({
+      file,
+      jobId:(crypto.randomUUID?crypto.randomUUID():("id_"+Date.now()+"_"+Math.random().toString(36).slice(2))),
+      name:file.name,
+      sizeMB:+(file.size/1024/1024).toFixed(2)
+    }));
 
-      // Stage 1: Show loading placeholder (reading file)
-      setInputPapers(p=>[...p,{
-        id:jobId,
-        name:name+" ⏳",
+    // Stage 0 · SHOW ALL PLACEHOLDERS INSTANTLY (all names appear at once)
+    setInputPapers(p=>[
+      ...p,
+      ...jobs.map(j=>({
+        id:j.jobId,
+        name:j.name+" ⏳",
         content:"[Reading file...]",
-        meta:{sizeMB,pages:null,chars:0,sentChars:0,level:"unknown",reason:null},
+        meta:{sizeMB:j.sizeMB,pages:null,chars:0,sentChars:0,level:"unknown",reason:null},
         structured:null,
         cacheHit:false
-      }].slice(0,MAX_PAPERS));
+      }))
+    ].slice(0,MAX_PAPERS));
 
+    // Stage 1 + 2 · Process all files IN PARALLEL (10 files process simultaneously)
+    // Stage 2 现在只做缓存查询，不调用 AI 精读（精读延迟到 analyzePapers 点击时）
+    await Promise.all(jobs.map(async({file,jobId,name,sizeMB})=>{
       try{
-        // Stage 1: Parse file -> text
+        // Stage 1: Parse file -> text (browser-local, no API cost)
         const {content,meta}=await readFileAsTextMeta(file);
+
+        // Stage 2: Check cache only (NO API call on upload)
+        let structured=null;
+        let fromCache=false;
+        if(content && !content.startsWith("[") && content.trim().length>200){
+          try{
+            const hash=await hashContent(content);
+            structured=await getPaperFromCache(hash);
+            fromCache=!!structured;
+          }catch(e){/* hash failure non-fatal */}
+        }
+
         setInputPapers(p=>p.map(pp=>pp.id===jobId?{
           ...pp,
-          name:name+" 🔍",
+          name: meta.level==="over" ? (name+" ⚠️") : (structured ? (name+" 💾") : name),
           content,
-          meta
+          meta,
+          structured,
+          cacheHit:fromCache
         }:pp));
-
-        // Stage 2: Structured reading with cache
-        // Only if content is valid (not error/too-large)
-        if(content && !content.startsWith("[") && content.trim().length>200){
-          const hash=await hashContent(content);
-          let structured=await getPaperFromCache(hash);
-          const fromCache=!!structured;
-
-          if(!structured){
-            // Cache miss — call DeepSeek to extract structured summary
-            const readerPrompt=`【原文·${content.length} 字】\n\n${content.substring(0,FILE_LIMITS.PER_PAPER_SENT)}\n\n请按系统提示词的规范,对该论文进行结构化精读,输出完整 JSON。`;
-            try{
-              // W1 精读 · E1 事实捕获层 — Full Premium 升级：Gemini 2.5 Pro
-              // 精读质量决定新思想能否涌现：Flash 可能漏掉 implicit gaps，Pro 能捕获到跨篇纠缠点
-              const rawRes=await api(readerPrompt, PAPER_READER_SYS, 8000, null, null, "gemini", "premium");
-              structured=parseJSONSafe(rawRes, null);
-              if(structured){
-                await savePaperToCache(hash, structured);
-              }
-            }catch(e){
-              console.warn("Structured reading failed:", e.message);
-            }
-          }
-
-          setInputPapers(p=>p.map(pp=>pp.id===jobId?{
-            ...pp,
-            name: meta.level==="over" ? (name+" ⚠️") : (structured ? (name+(fromCache?" 💾":" ✅")) : (name+" ⚡")),
-            content,
-            meta,
-            structured,
-            cacheHit:fromCache
-          }:pp));
-        } else {
-          // File read failed or empty — show as-is, no structured reading
-          setInputPapers(p=>p.map(pp=>pp.id===jobId?{
-            ...pp,
-            name:meta.level==="over"?name+" ⚠️":name,
-            content,
-            meta
-          }:pp));
-        }
       }catch(e){
         setInputPapers(p=>p.map(pp=>pp.id===jobId?{
           ...pp,
@@ -2435,7 +2417,8 @@ Language: ${lf}.`;
           meta:{sizeMB,pages:null,chars:0,sentChars:0,level:"over",reason:e.message}
         }:pp));
       }
-    }
+    }));
+
     if(paFileRef.current)paFileRef.current.value="";
   };
   const addPastedText=()=>{
@@ -2477,11 +2460,64 @@ Language: ${lf}.`;
     const ctrl=new AbortController();paAbort.current=ctrl;const sig=ctrl.signal;
     setPaBusy(true);setPaLogs([]);setPaResult(null);setPaPhase("...");
     const add=(r,x)=>{setPaLogs(p=>[...p,{role:r,text:x}]);};
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Stage 0 · W1 精读（并发）— 延迟执行的结构化精读
+    // 上传时只做 PDF 解析，精读等到点击"分析全部文章"时并发调用 Gemini Pro
+    // 这样：上传瞬间完成 + 用户可以删减不要的论文 + 只为确定用的文章付费
+    // ═══════════════════════════════════════════════════════════════════
+    const validCopy=valid.map(p=>({...p}));
+    const needsReading=validCopy.filter(p=>!p.structured);
+    if(needsReading.length>0){
+      add("sys",`⏳ ${lang==="zh"?"W1 精读阶段 · 并发调用 Gemini 2.5 Pro":"W1 Reading Stage · parallel Gemini 2.5 Pro"} — ${needsReading.length} ${lang==="zh"?"篇论文":"papers"}`);
+      setPaPhase(lang==="zh"?`精读 ${needsReading.length} 篇论文中`:`Reading ${needsReading.length} papers`);
+
+      await Promise.all(needsReading.map(async(paper)=>{
+        try{
+          if(sig.aborted)throw new DOMException("","AbortError");
+          const hash=await hashContent(paper.content);
+          let structured=await getPaperFromCache(hash);
+          const fromCache=!!structured;
+
+          if(!structured){
+            const readerPrompt=`【原文·${paper.content.length} 字】\n\n${paper.content.substring(0,FILE_LIMITS.PER_PAPER_SENT)}\n\n请按系统提示词的规范,对该论文进行结构化精读,输出完整 JSON。`;
+            // W1 精读 · E1 事实捕获层 — Full Premium：Gemini 2.5 Pro
+            const rawRes=await api(readerPrompt, PAPER_READER_SYS, 8000, sig, null, "gemini", "premium");
+            structured=parseJSONSafe(rawRes, null);
+            if(structured){
+              await savePaperToCache(hash, structured);
+            }
+          }
+
+          if(structured){
+            paper.structured=structured;
+            paper.cacheHit=fromCache;
+            // Update UI state for this paper
+            setInputPapers(p=>p.map(pp=>pp.id===paper.id?{
+              ...pp,
+              name:pp.name.replace(/ [⏳🔍✅💾⚡⚠️❌]$/,"")+(fromCache?" 💾":" ✅"),
+              structured,
+              cacheHit:fromCache
+            }:pp));
+            add("sys",`  ${fromCache?"💾":"✅"} ${paper.name.replace(/ [⏳🔍✅💾⚡⚠️❌]$/,"")}`);
+          } else {
+            add("sys",`  ⚡ ${paper.name.replace(/ [⏳🔍✅💾⚡⚠️❌]$/,"")} (${lang==="zh"?"精读失败,将用原文兜底":"reading failed, fallback to raw"})`);
+          }
+        }catch(e){
+          if(e.name==="AbortError")throw e;
+          add("sys",`  ✗ ${paper.name}: ${e.message}`);
+        }
+      }));
+
+      const structuredNow=validCopy.filter(p=>p.structured).length;
+      add("sys",`✅ ${lang==="zh"?"W1 精读完成":"W1 Reading complete"}: ${structuredNow}/${validCopy.length}`);
+    }
+
     // 升级:优先使用结构化精读结果(3000 字/篇),缓存命中零成本
     // 兜底:未结构化则退回原文前 3000 字
-    const structuredCount=valid.filter(p=>p.structured).length;
-    const cachedCount=valid.filter(p=>p.cacheHit).length;
-    const digest=valid.map((p,i)=>{
+    const structuredCount=validCopy.filter(p=>p.structured).length;
+    const cachedCount=validCopy.filter(p=>p.cacheHit).length;
+    const digest=validCopy.map((p,i)=>{
       if(p.structured){
         // 用结构化精读结果(~2500-3000 字/篇,高信息密度)
         const s=p.structured;
