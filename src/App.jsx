@@ -2512,9 +2512,10 @@ Language: ${lf}.`;
 
         if(!structured){
           const readerPrompt=`【原文·${paper.content.length} 字】\n\n${paper.content.substring(0,FILE_LIMITS.PER_PAPER_SENT)}\n\n请按系统提示词的规范,对该论文进行结构化精读,输出完整 JSON。`;
-          // W1 精读 · E1 事实捕获 — 降回 Flash（Pro 2 万字精读会超时,Flash 5-10 秒稳定返回）
-          // 精读本质是结构化信息提取,Flash 的性价比和稳定性都更优
-          const rawRes=await api(readerPrompt, PAPER_READER_SYS, 8000, sig, null, "gemini", "economy");
+          // W1 精读 · E1 事实捕获 — Flash + max_tokens=4000 避免 CF Worker 100s 超时
+          // 生成 8000 tokens JSON 偶尔会触发 Cloudflare 100s subrequest 硬超时
+          // 降到 4000 tokens 输出响应时间减半(约 15-25s)，稳定远离超时红线
+          const rawRes=await api(readerPrompt, PAPER_READER_SYS, 4000, sig, null, "gemini", "economy");
           if(rawRes.startsWith("[Error")){throw new Error(rawRes);}
           structured=parseJSONSafe(rawRes, null);
           if(structured){await savePaperToCache(hash, structured);}
